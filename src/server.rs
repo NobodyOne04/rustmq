@@ -12,6 +12,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 use crate::broker::{Broker, BrokerError, ConsumerId, Delivery};
 use crate::metrics::Metrics;
@@ -46,6 +47,9 @@ pub struct ServerConfig {
     /// After the shutdown signal, how long connections get to finish before they are
     /// aborted.
     pub shutdown_timeout: Duration,
+    /// A connection that hasn't completed HELLO this long after it was accepted gets
+    /// `BAD_REQUEST` and is closed (ADR 0013). Zero turns it off.
+    pub hello_timeout: Duration,
 }
 
 /// Serves connections until `shutdown` completes (or accepting fails), then stops accepting,
@@ -87,6 +91,7 @@ pub async fn run(
                         peer,
                         broker.clone(),
                         config.limits.clone(),
+                        config.hello_timeout,
                         permit,
                         stop.clone(),
                     )),
@@ -145,9 +150,16 @@ async fn connection(
     peer: std::net::SocketAddr,
     broker: Arc<Broker>,
     limits: Limits,
+    hello_timeout: Duration,
     _permit: OwnedSemaphorePermit,
     stop: watch::Receiver<bool>,
 ) {
+    // `checked_add`: `+` panics past the clock's range; too far away is the same as off.
+    let hello_deadline = if hello_timeout.is_zero() {
+        None
+    } else {
+        Instant::now().checked_add(hello_timeout)
+    };
     // Rust note: `into_split` gives two owned halves, so the reader and the writer can live
     // in different tasks without sharing (or locking) the stream.
     let (read, write) = stream.into_split();
@@ -174,7 +186,8 @@ async fn connection(
         in_flight: HashMap::new(),
         next_delivery_id: 0,
     };
-    conn.read_loop(BufReader::new(read), deliveries, stop).await;
+    conn.read_loop(BufReader::new(read), deliveries, stop, hello_deadline, peer)
+        .await;
 
     for queue in &conn.subscriptions {
         conn.broker.consumer_gone(queue, consumer).await;
@@ -248,6 +261,8 @@ impl Connection {
         mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         mut deliveries: mpsc::Receiver<Delivery>,
         mut stop: watch::Receiver<bool>,
+        hello_deadline: Option<Instant>,
+        peer: std::net::SocketAddr,
     ) {
         let mut buf = Vec::new();
         let mut hello_done = false;
@@ -275,6 +290,18 @@ impl Connection {
                 // Rust note: it returns a guard holding a lock; the `async` block drops it
                 // at once, or it would sit in `select!`'s output and make this future !Send.
                 () = async { let _ = stop.wait_for(|&stopped| stopped).await; } => Next::Close,
+                // Rust note: `, if !hello_done` disables the branch once HELLO succeeded, so
+                // an idle consumer is never timed out. The future is still built each turn,
+                // hence `pending` instead of unwrapping a `None` deadline.
+                () = async {
+                    match hello_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !hello_done => {
+                    tracing::info!(conn = self.consumer, %peer, "no HELLO in time, closing");
+                    self.reply(ServerFrame::error(None, ErrorCode::BadRequest), Next::Close).await
+                }
             };
             if let Next::Close = next {
                 return;

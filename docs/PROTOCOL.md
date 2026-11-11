@@ -17,7 +17,8 @@ library can implement it. Decisions behind it: [ADR 0002](adr/0002-wire-protocol
 - The connection stays open for any number of requests.
 
 ## Session
-1. Client sends `HELLO` as its first frame.
+1. Client sends `HELLO` as its first frame, within the server's `hello_timeout` (default 10 s)
+   of connecting; otherwise it gets `ERROR BAD_REQUEST` (no `request_id`) and is closed.
 2. Server answers `RESPONSE` with the chosen version and its limits, or `ERROR
    UNSUPPORTED_VERSION` and closes. Any other first frame: `ERROR BAD_REQUEST` and close.
 3. Client sends any requests, in any order, without waiting for answers. Each answer

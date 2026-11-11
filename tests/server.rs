@@ -38,7 +38,14 @@ async fn start_with(
     config: BrokerConfig,
     max_connections: usize,
 ) -> std::net::SocketAddr {
-    let server = Server::start(limits, config, max_connections, Duration::from_secs(5)).await;
+    let server = Server::start(
+        limits,
+        config,
+        max_connections,
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    )
+    .await;
     // Never stopped: the test's runtime ends it. Forgetting the sender keeps `stop` pending.
     std::mem::forget(server.stop);
     server.addr
@@ -57,6 +64,7 @@ impl Server {
         config: BrokerConfig,
         max_connections: usize,
         shutdown_timeout: Duration,
+        hello_timeout: Duration,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -68,6 +76,7 @@ impl Server {
             limits,
             max_connections,
             shutdown_timeout,
+            hello_timeout,
         };
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(run(listener, broker, config, async {
@@ -489,6 +498,31 @@ async fn broker_limits_reach_the_client() {
     assert_eq!(c.message().await["body"], "a");
 }
 
+/// ADR 0013: a connection that never sends HELLO is closed after `hello_timeout`; one that
+/// did is not. No sleep: `greeted` is accepted before `silent`, so by the time `silent` is
+/// closed `greeted`'s deadline has passed too, and its STATS answer shows HELLO turned the
+/// timer off. Real clock on purpose: with a paused clock tokio's auto-advance can jump to
+/// `recv`'s timeout while a reply is still crossing the loopback socket.
+#[tokio::test]
+async fn hello_timeout_closes_only_connections_without_hello() {
+    let server = Server::start(
+        limits(1, 16),
+        BrokerConfig::default(),
+        1024,
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    )
+    .await;
+    let mut greeted = Client::hello(server.addr).await;
+    let mut silent = Client::connect(server.addr).await;
+
+    assert_eq!(code(&silent.recv().await.unwrap()), "BAD_REQUEST");
+    assert!(silent.recv().await.is_none(), "closed after the timeout");
+
+    let r = greeted.request(json!({"type": "STATS"})).await;
+    assert_eq!(r["type"], "RESPONSE", "{r}");
+}
+
 #[tokio::test]
 async fn shutdown_closes_active_connections() {
     let server = Server::start(
@@ -496,6 +530,7 @@ async fn shutdown_closes_active_connections() {
         BrokerConfig::default(),
         1024,
         Duration::from_secs(5),
+        Duration::from_secs(10),
     )
     .await;
     let addr = server.addr;
@@ -535,6 +570,7 @@ async fn shutdown_timeout_aborts_stuck_connections() {
         BrokerConfig::default(),
         1024,
         Duration::from_millis(200),
+        Duration::from_secs(10),
     )
     .await;
     let mut stalled = Client::hello(server.addr).await;

@@ -85,6 +85,9 @@ struct ServerArgs {
     max_ttl_ms: Option<u64>,
     #[arg(long, default_value_t = millis(Config::default().shutdown_timeout))]
     shutdown_timeout_ms: u64,
+    /// Close connections that haven't sent HELLO by then; 0 turns it off.
+    #[arg(long, default_value_t = millis(Config::default().hello_timeout))]
+    hello_timeout_ms: u64,
     /// error, warn, info, debug or trace.
     #[arg(long, default_value_t = tracing::Level::INFO)]
     log: tracing::Level,
@@ -178,6 +181,7 @@ async fn serve(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         default_ttl: args.default_ttl_ms.map(Duration::from_millis),
         max_ttl: args.max_ttl_ms.map(Duration::from_millis),
         shutdown_timeout: Duration::from_millis(args.shutdown_timeout_ms),
+        hello_timeout: Duration::from_millis(args.hello_timeout_ms),
     };
     let (broker_config, server_config) = config.validate()?;
     let listener = TcpListener::bind(args.bind).await?;

@@ -52,6 +52,7 @@ async fn bodies_are_never_logged() {
         },
         max_connections: 16,
         shutdown_timeout: Duration::from_secs(1),
+        hello_timeout: Duration::from_secs(10),
     };
     tokio::spawn(run(
         listener,

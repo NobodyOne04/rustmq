@@ -1,0 +1,47 @@
+# 0013. Handshake timeout: a connection must send HELLO within `hello_timeout`
+
+- Status: Accepted
+- Date: 2026-11-11
+
+A connection that doesn't complete HELLO within `hello_timeout` (default 10 s) gets
+`ERROR BAD_REQUEST` and is closed, so silent sockets can't hold connection slots forever.
+
+## Technical details
+
+**Problem.** Found by the automated security review of [0006](0006-resource-limits.adr): a
+client can open `max_connections` sockets and never send a byte. Each holds a slot
+indefinitely, and every other client gets `TOO_MANY_CONNECTIONS`. Nothing today closes a
+connection that never speaks.
+
+**Decision.**
+- New setting `hello_timeout` (default 10 s, `0` = off) in `ServerConfig`; a `server` flag
+  `--hello-timeout-ms` once [0012](0012-cli-and-config.adr) exists (its `config` rules apply).
+- In the connection's reader (`src/server.rs`, [0004](0004-connection-reader-writer.adr)):
+  until HELLO succeeds, the `select!` has one more branch,
+  `sleep_until(accepted_at + hello_timeout)`. When it fires: send
+  `ERROR BAD_REQUEST` (no `request_id`) and close, the same path as a missing HELLO today.
+  After HELLO the branch is gone, so idle consumers are never timed out.
+- `tokio::time` instants ([0005](0005-delivery-state-requeue-ttl.adr)). The test runs on the real
+  clock with a 200 ms timeout and orders events by replies, not sleeps: a paused clock over
+  real TCP let tokio's auto-advance fire the test client's own timeout mid-round-trip.
+- Logged at info with the peer ([0008](0008-observability.adr)).
+- `docs/PROTOCOL.md`: the session section says HELLO must arrive within the server's
+  `hello_timeout`. The BAD_REQUEST row already says "closed if HELLO is missing".
+
+**What it does not stop.** A client that sends HELLO and then idles still holds its slot.
+That is legitimate (a consumer waiting for messages looks the same), and with no
+authentication in v1 (SPEC §10) anyone can open those. This closes the cheapest variant
+(no protocol work at all) and abandoned half-open sockets.
+
+**Consequences.**
+- Very slow clients on a bad link need more than 10 s for one small frame before they are cut
+  off; the setting can be raised or turned off.
+- No new error code: the protocol stays version 1.
+
+## Technologies and alternatives
+- Involved: tokio (`time::sleep_until`, `select!`).
+- Alternatives:
+  - Idle timeout on every connection: closes legitimate consumers waiting for messages.
+  - Connection limit per peer IP: more state, defeated by many source addresses, and wrong
+    behind NAT; worth it only with authentication.
+  - A new `HELLO_TIMEOUT` error code: clearer to clients, but a protocol change.

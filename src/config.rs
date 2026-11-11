@@ -30,6 +30,8 @@ pub struct Config {
     pub default_ttl: Option<Duration>,
     pub max_ttl: Option<Duration>,
     pub shutdown_timeout: Duration,
+    /// Zero turns the HELLO timeout off (ADR 0013).
+    pub hello_timeout: Duration,
 }
 
 impl Default for Config {
@@ -49,6 +51,7 @@ impl Default for Config {
             default_ttl: broker.default_ttl,
             max_ttl: broker.max_ttl,
             shutdown_timeout: Duration::from_secs(5),
+            hello_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -118,6 +121,7 @@ impl Config {
             },
             max_connections: self.max_connections,
             shutdown_timeout: self.shutdown_timeout,
+            hello_timeout: self.hello_timeout,
         };
         Ok((broker, server))
     }
