@@ -254,7 +254,10 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(
     // Rust note: `take` consumes its receiver, so it gets `&mut *reader` (a fresh borrow)
     // instead of `reader` itself; the reader is usable again once this call returns.
     // The limit counts what an earlier, cancelled call already put in `buf`.
-    let limit = (max_frame as u64 + 1).saturating_sub(buf.len() as u64);
+    // `saturating_add`: a client gets `max_frame` from the server, maybe `usize::MAX`.
+    let limit = (max_frame as u64)
+        .saturating_add(1)
+        .saturating_sub(buf.len() as u64);
     (&mut *reader).take(limit).read_until(b'\n', buf).await?;
     if buf.last() == Some(&b'\n') {
         buf.pop();
@@ -514,6 +517,15 @@ mod tests {
         assert!(
             matches!(err, ProtocolError::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
         );
+    }
+
+    #[tokio::test]
+    async fn the_largest_limit_does_not_overflow() {
+        let mut r = BufReader::new(&b"{}\n"[..]);
+        let frame = read_frame(&mut r, &mut Vec::new(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(frame.as_deref(), Some(&b"{}"[..]));
     }
 
     /// A read cancelled mid-frame (as when it loses a `select!`) keeps the bytes it read.
