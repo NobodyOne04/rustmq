@@ -1,0 +1,39 @@
+name: telegram
+on:
+  pull_request:
+    types: [opened, closed]
+  workflow_run:
+    workflows: [check]
+    types: [completed]
+permissions: {}
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      # Event text goes through env, never ${{ }} inside the script: a PR title could inject shell.
+      - env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          RUN_RESULT: ${{ github.event.workflow_run.conclusion }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          if [ "$EVENT" = workflow_run ]; then
+            text="CI $RUN_RESULT on $RUN_BRANCH: $RUN_URL"
+          elif [ "$ACTION" = opened ]; then
+            text="New PR: $PR_TITLE $PR_URL"
+          elif [ "$MERGED" = true ]; then
+            text="Merged: $PR_TITLE $PR_URL"
+          else
+            exit 0  # closed without merge: stay quiet
+          fi
+          # TELEGRAM_CHAT_ID holds one or more chat IDs, comma-separated.
+          for id in $(echo "$CHAT" | tr ',' ' '); do
+            curl -sf "https://api.telegram.org/bot$TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$id" --data-urlencode "text=$text" > /dev/null
+          done

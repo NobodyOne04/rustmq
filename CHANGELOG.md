@@ -18,6 +18,7 @@
 - Project specification in `docs/SPEC.md`, with the agreed clarifications
 
 ### Changed
+- CI: post opened PRs, merges and CI results to Telegram chats
 - The byte limit charges each message 128 bytes on top of its body, so empty messages can't fill memory unchecked
 - Typed errors at every edge: `ServerError` from `server::run`, `main` returns a `Result`
 - ADRs 0001–0003 rewritten in the new template (purpose, technical details, technologies), with the details of what was built
