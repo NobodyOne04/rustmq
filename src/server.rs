@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::BufReader;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -85,10 +86,8 @@ struct Connection {
     outbound: mpsc::Sender<ServerFrame>,
     deliveries_tx: mpsc::Sender<Delivery>,
     subscriptions: Vec<String>,
-    /// `delivery_id` → the queue and its tag, to route an ACK.
-    // shortcut: entries for deliveries a queue takes back without telling us stay until the
-    // client ACKs them (and gets UNKNOWN_DELIVERY); fine while that only happens to a
-    // consumer the queue dropped. ADR 0005's ack timeout must clean them up.
+    /// `delivery_id` → the queue and its tag, to route an ACK. A queue that takes a delivery
+    /// back (ack timeout) doesn't tell us; `on_delivery` drops such entries.
     in_flight: HashMap<u64, (Arc<str>, u64)>,
     next_delivery_id: u64,
 }
@@ -180,16 +179,15 @@ impl Connection {
         request.validate(self.limits.max_queue_name_len, self.limits.max_message_size)?;
         match request {
             Request::Hello { .. } => Err(ErrorCode::BadRequest), // repeated HELLO
-            // shortcut: `ttl_ms` is accepted and ignored until ADR 0005.
             Request::Publish {
                 request_id,
                 queue,
                 body,
-                ..
+                ttl_ms,
             } => {
                 let message_id = self
                     .broker
-                    .publish(&queue, body.into())
+                    .publish(&queue, body.into(), ttl_ms.map(Duration::from_millis))
                     .await
                     .map_err(broker_code)?;
                 Ok(ServerFrame::Response {
@@ -246,6 +244,7 @@ impl Connection {
         self.next_delivery_id += 1;
         let delivery_id = self.next_delivery_id;
         self.in_flight.insert(delivery_id, (d.queue.clone(), d.tag));
+        self.forget_timed_out(&d.queue);
         let frame = ServerFrame::Message {
             queue: d.queue.to_string(),
             message_id: d.message_id,
@@ -254,6 +253,28 @@ impl Connection {
             redelivered: d.redelivered,
         };
         self.reply(frame, Next::Continue).await
+    }
+
+    /// A queue holds at most `prefetch` live deliveries per connection, so more entries for
+    /// `queue` mean some timed out. With one ack timeout per queue they time out in the order
+    /// they were sent, so the oldest are the dead ones; their ACK now gets UNKNOWN_DELIVERY
+    /// here, as the queue would answer. Keeps `in_flight` bounded for a client that never ACKs.
+    // shortcut: a scan of all entries per delivery, at most max_subscriptions × prefetch + 1;
+    // index by queue if those limits grow large.
+    fn forget_timed_out(&mut self, queue: &str) {
+        let mut ids: Vec<u64> = self
+            .in_flight
+            .iter()
+            .filter(|(_, (q, _))| &**q == queue)
+            .map(|(&id, _)| id)
+            .collect();
+        if ids.len() <= self.limits.prefetch {
+            return;
+        }
+        ids.sort_unstable();
+        for id in &ids[..ids.len() - self.limits.prefetch] {
+            self.in_flight.remove(id);
+        }
     }
 
     /// Queues a frame for the writer. Waits if the client isn't reading (its own

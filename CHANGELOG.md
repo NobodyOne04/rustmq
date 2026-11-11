@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Ack timeout (unacked deliveries go back to the front) and message TTL, both checked by the queue's own task
 - TCP server: a reader and a writer task per connection, so a client that stops reading slows only itself
 - Queues: one task per queue, FIFO, competing consumers with prefetch, requeue when a consumer leaves
 - Wire protocol: JSON frames, HELLO handshake, error codes, documented in `docs/PROTOCOL.md`

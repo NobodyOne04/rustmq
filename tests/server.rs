@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustmq::broker::Broker;
+use rustmq::broker::{Broker, BrokerConfig};
 use rustmq::protocol::{Limits, read_frame};
 use rustmq::server::serve;
 use serde_json::{Value, json};
@@ -26,9 +26,17 @@ fn limits(prefetch: usize, max_subscriptions: usize) -> Limits {
 
 /// Starts a server on a free port; returns its address.
 async fn start(limits: Limits) -> std::net::SocketAddr {
+    start_with(limits, BrokerConfig::default()).await
+}
+
+/// Like `start`, with these queue settings (`prefetch` comes from `limits`).
+async fn start_with(limits: Limits, config: BrokerConfig) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let broker = Arc::new(Broker::new(limits.prefetch));
+    let broker = Arc::new(Broker::with_config(BrokerConfig {
+        prefetch: limits.prefetch,
+        ..config
+    }));
     tokio::spawn(serve(listener, broker, limits));
     addr
 }
@@ -322,4 +330,59 @@ async fn stalled_reader_slows_only_itself() {
     third.subscribe("small").await;
     assert_eq!(third.message().await["body"], "still here");
     drop(stalled);
+}
+
+#[tokio::test]
+async fn ttl_ms_reaches_the_queue() {
+    let addr = start(limits(1, 16)).await;
+    let mut producer = Client::hello(addr).await;
+    // TTL 0: expired by the time anyone could take it
+    let r = producer
+        .request(json!({"type": "PUBLISH", "queue": "q", "body": "gone", "ttl_ms": 0}))
+        .await;
+    assert!(r["message_id"].is_u64(), "still accepted: {r}");
+    producer.publish("q", "kept").await;
+    let mut consumer = Client::hello(addr).await;
+    consumer.subscribe("q").await;
+    assert_eq!(consumer.message().await["body"], "kept");
+}
+
+/// The ack timeout takes a delivery back from a live connection: its old `delivery_id` is
+/// then unknown, the redelivery has a new one. Real clock, short timeout: the test waits on
+/// the redelivery, not on a sleep.
+#[tokio::test]
+async fn ack_after_timeout_is_unknown() {
+    let config = BrokerConfig {
+        ack_timeout: Duration::from_millis(50),
+        ..BrokerConfig::default()
+    };
+    let addr = start_with(limits(1, 16), config).await;
+    let mut producer = Client::hello(addr).await;
+    let mut consumer = Client::hello(addr).await;
+    consumer.subscribe("q").await;
+    let id = producer.publish("q", "slow work").await;
+
+    let first = consumer.message().await;
+    let mut last = first.clone();
+    // Not acking: it comes back, to the same consumer, several times over.
+    for _ in 0..3 {
+        let again = consumer.message().await;
+        assert_eq!(
+            (&again["message_id"], &again["redelivered"]),
+            (&json!(id), &json!(true))
+        );
+        assert_ne!(again["delivery_id"], last["delivery_id"]);
+        last = again;
+    }
+    // The connection forgot the old ids: unknown without asking the queue.
+    assert_eq!(
+        code(&consumer.ack(&first["delivery_id"]).await),
+        "UNKNOWN_DELIVERY"
+    );
+    // The latest may itself have timed out by now; either answer is correct.
+    let r = consumer.ack(&last["delivery_id"]).await;
+    assert!(
+        r["type"] == "RESPONSE" || code(&r) == "UNKNOWN_DELIVERY",
+        "{r}"
+    );
 }

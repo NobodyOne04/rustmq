@@ -5,6 +5,7 @@ mod queue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -17,6 +18,30 @@ const COMMAND_BUFFER: usize = 1024;
 /// Identifies one subscriber (a connection) across all queues.
 pub type ConsumerId = u64;
 
+/// What every queue of a broker follows (SPEC §14.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrokerConfig {
+    /// Unacked deliveries allowed per consumer per queue (at least 1).
+    pub prefetch: usize,
+    /// An unacked delivery older than this goes back to its queue. Zero turns it off.
+    pub ack_timeout: Duration,
+    /// TTL for a message published without one. `None`: no TTL.
+    pub default_ttl: Option<Duration>,
+    /// Upper bound for any message's TTL.
+    pub max_ttl: Option<Duration>,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            prefetch: 1,
+            ack_timeout: Duration::from_secs(30),
+            default_ttl: None,
+            max_ttl: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BrokerError {
     #[error("no such unacked delivery for this consumer")]
@@ -26,7 +51,7 @@ pub enum BrokerError {
 }
 
 pub struct Broker {
-    prefetch: usize,
+    config: BrokerConfig,
     // Rust note: a std (not tokio) Mutex is right here: it's held only for a map lookup and
     // never across an `.await`, so it can't block the async runtime.
     queues: Mutex<HashMap<Arc<str>, mpsc::Sender<Command>>>,
@@ -35,10 +60,20 @@ pub struct Broker {
 }
 
 impl Broker {
-    /// `prefetch`: unacked deliveries allowed per consumer per queue (at least 1).
+    /// The default config with this `prefetch`.
     pub fn new(prefetch: usize) -> Self {
+        Self::with_config(BrokerConfig {
+            prefetch,
+            ..BrokerConfig::default()
+        })
+    }
+
+    pub fn with_config(config: BrokerConfig) -> Self {
         Self {
-            prefetch: prefetch.max(1),
+            config: BrokerConfig {
+                prefetch: config.prefetch.max(1),
+                ..config
+            },
             queues: Mutex::new(HashMap::new()),
             message_ids: Arc::new(AtomicU64::new(0)),
             consumer_ids: AtomicU64::new(0),
@@ -50,10 +85,17 @@ impl Broker {
     }
 
     /// Adds a message to the end of `queue` (created if new). Returns its message id once
-    /// it is in the queue.
-    pub async fn publish(&self, queue: &str, body: Arc<str>) -> Result<u64, BrokerError> {
+    /// it is in the queue. `ttl`: the client's, else the config's default; capped by
+    /// `max_ttl`.
+    pub async fn publish(
+        &self,
+        queue: &str,
+        body: Arc<str>,
+        ttl: Option<Duration>,
+    ) -> Result<u64, BrokerError> {
         let (reply, rx) = oneshot::channel();
-        self.send(queue, Command::Publish { body, reply }).await?;
+        self.send(queue, Command::Publish { body, ttl, reply })
+            .await?;
         rx.await.map_err(|_| BrokerError::QueueStopped)
     }
 
@@ -135,7 +177,7 @@ impl Broker {
         }
         let name: Arc<str> = name.into();
         let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
-        let actor = QueueActor::new(name.clone(), self.prefetch, self.message_ids.clone());
+        let actor = QueueActor::new(name.clone(), self.config, self.message_ids.clone());
         tokio::spawn(actor.run(rx));
         queues.insert(name, tx.clone());
         tx
@@ -173,7 +215,7 @@ mod tests {
         let b = Broker::new(10);
         let mut ids = Vec::new();
         for i in 0..5 {
-            ids.push(b.publish("q", body(&i.to_string())).await.unwrap());
+            ids.push(b.publish("q", body(&i.to_string()), None).await.unwrap());
         }
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
         let (_, mut rx) = subscriber(&b, "q", 10).await;
@@ -190,14 +232,15 @@ mod tests {
     async fn prefetch_limits_unacked() {
         let b = Broker::new(1);
         let (c, mut rx) = subscriber(&b, "q", 1).await;
-        b.publish("q", body("a")).await.unwrap();
-        b.publish("q", body("b")).await.unwrap();
+        b.publish("q", body("a"), None).await.unwrap();
+        b.publish("q", body("b"), None).await.unwrap();
         let first = rx.recv().await.unwrap();
         assert_eq!(
             settle(&b, "q").await,
             QueueStats {
                 ready: 1,
-                unacked: 1
+                unacked: 1,
+                expired: 0,
             }
         );
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
@@ -210,7 +253,7 @@ mod tests {
         let b = Broker::new(1);
         let (c1, mut rx1) = subscriber(&b, "q", 1).await;
         let (c2, _rx2) = subscriber(&b, "q", 1).await;
-        b.publish("q", body("a")).await.unwrap();
+        b.publish("q", body("a"), None).await.unwrap();
         let d = rx1.recv().await.unwrap();
         assert_eq!(
             b.ack("q", c2, d.tag).await,
@@ -231,9 +274,9 @@ mod tests {
         let b = Broker::new(1);
         let (_, mut rx1) = subscriber(&b, "q", 1).await;
         let (_, mut rx2) = subscriber(&b, "q", 1).await;
-        b.publish("q", body("a")).await.unwrap();
-        b.publish("q", body("b")).await.unwrap();
-        b.publish("q", body("c")).await.unwrap();
+        b.publish("q", body("a"), None).await.unwrap();
+        b.publish("q", body("b"), None).await.unwrap();
+        b.publish("q", body("c"), None).await.unwrap();
         assert_eq!(&*rx1.recv().await.unwrap().body, "a");
         assert_eq!(&*rx2.recv().await.unwrap().body, "b");
         // both hold one unacked message: "c" waits
@@ -241,7 +284,8 @@ mod tests {
             settle(&b, "q").await,
             QueueStats {
                 ready: 1,
-                unacked: 2
+                unacked: 2,
+                expired: 0,
             }
         );
     }
@@ -251,7 +295,7 @@ mod tests {
         let b = Broker::new(2);
         let (c1, mut rx1) = subscriber(&b, "q", 2).await;
         for s in ["a", "b", "c"] {
-            b.publish("q", body(s)).await.unwrap();
+            b.publish("q", body(s), None).await.unwrap();
         }
         let a = rx1.recv().await.unwrap();
         let _b = rx1.recv().await.unwrap();
@@ -260,7 +304,8 @@ mod tests {
             settle(&b, "q").await,
             QueueStats {
                 ready: 3,
-                unacked: 0
+                unacked: 0,
+                expired: 0,
             }
         );
 
@@ -285,7 +330,7 @@ mod tests {
         let (_, rx1) = subscriber(&b, "q", 1).await;
         drop(rx1);
         let (_, mut rx2) = subscriber(&b, "q", 1).await;
-        b.publish("q", body("a")).await.unwrap();
+        b.publish("q", body("a"), None).await.unwrap();
         let d = rx2.recv().await.unwrap();
         assert_eq!(&*d.body, "a");
     }
@@ -294,14 +339,15 @@ mod tests {
     async fn too_small_channel_drops_consumer_not_message() {
         let b = Broker::new(2);
         let (c1, mut rx1) = subscriber(&b, "q", 1).await; // smaller than prefetch: a misuse
-        b.publish("q", body("a")).await.unwrap();
-        b.publish("q", body("b")).await.unwrap();
+        b.publish("q", body("a"), None).await.unwrap();
+        b.publish("q", body("b"), None).await.unwrap();
         // "b" didn't fit: c1 was dropped and "a" requeued with it
         assert_eq!(
             settle(&b, "q").await,
             QueueStats {
                 ready: 2,
-                unacked: 0
+                unacked: 0,
+                expired: 0,
             }
         );
         assert_eq!(&*rx1.recv().await.unwrap().body, "a");
@@ -314,15 +360,154 @@ mod tests {
         let (_, mut stuck) = subscriber(&b, "a", 1).await;
         let (_, mut rx_b) = subscriber(&b, "b", 1).await;
         for i in 0..100 {
-            b.publish("a", body(&i.to_string())).await.unwrap();
+            b.publish("a", body(&i.to_string()), None).await.unwrap();
         }
         // "a" has a consumer that never acks; "b" still flows
-        b.publish("b", body("x")).await.unwrap();
+        b.publish("b", body("x"), None).await.unwrap();
         let d = rx_b.recv().await.unwrap();
         assert_eq!((&*d.queue, &*d.body), ("b", "x"));
         assert_eq!(&*stuck.recv().await.unwrap().queue, "a");
         assert_eq!(rx_b.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(b.queue_count(), 2);
+    }
+
+    fn timed(ack_timeout_s: u64, default_ttl_s: Option<u64>, max_ttl_s: Option<u64>) -> Broker {
+        Broker::with_config(BrokerConfig {
+            prefetch: 2,
+            ack_timeout: Duration::from_secs(ack_timeout_s),
+            default_ttl: default_ttl_s.map(Duration::from_secs),
+            max_ttl: max_ttl_s.map(Duration::from_secs),
+        })
+    }
+
+    fn stats(ready: usize, unacked: usize, expired: u64) -> QueueStats {
+        QueueStats {
+            ready,
+            unacked,
+            expired,
+        }
+    }
+
+    // Rust note: `start_paused` freezes tokio's clock; `advance` moves it, and when every
+    // task is idle tokio jumps it to the next timer. No test here really sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn ack_timeout_requeues_to_the_front() {
+        let b = timed(10, None, None);
+        let (c, mut rx) = subscriber(&b, "q", 2).await;
+        for s in ["a", "b", "c"] {
+            b.publish("q", body(s), None).await.unwrap();
+        }
+        let a = rx.recv().await.unwrap();
+        let _b = rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert_eq!(settle(&b, "q").await, stats(1, 2, 0), "not yet");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // Both timed out, went back in front of "c", and come again (the credit came back).
+        let again: Vec<_> = [rx.recv().await.unwrap(), rx.recv().await.unwrap()].into();
+        assert_eq!(
+            (&*again[0].body, again[0].redelivered, again[0].message_id),
+            ("a", true, a.message_id)
+        );
+        assert_eq!((&*again[1].body, again[1].redelivered), ("b", true));
+        assert_eq!(settle(&b, "q").await, stats(1, 2, 0));
+        assert_eq!(
+            b.ack("q", c, a.tag).await,
+            Err(BrokerError::UnknownDelivery),
+            "the timed-out delivery"
+        );
+        b.ack("q", c, again[0].tag).await.unwrap();
+        assert_eq!(&*rx.recv().await.unwrap().body, "c");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ack_before_the_deadline_wins() {
+        let b = timed(10, None, None);
+        let (c, mut rx) = subscriber(&b, "q", 2).await;
+        b.publish("q", body("a"), None).await.unwrap();
+        let d = rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        b.ack("q", c, d.tag).await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(settle(&b, "q").await, stats(0, 0, 0));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_ack_timeout_is_off() {
+        let b = timed(0, None, None);
+        let (_, mut rx) = subscriber(&b, "q", 2).await;
+        b.publish("q", body("a"), None).await.unwrap();
+        rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(24 * 3600)).await;
+        assert_eq!(settle(&b, "q").await, stats(0, 1, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ttl_drops_messages_not_handed_out_in_time() {
+        let b = timed(0, None, None);
+        b.publish("q", body("short"), Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        b.publish("q", body("long"), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        b.publish("q", body("none"), None).await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        // Expiry is checked at hand-out only: still counted as ready.
+        assert_eq!(settle(&b, "q").await, stats(3, 0, 0));
+        let (_, mut rx) = subscriber(&b, "q", 2).await;
+        assert_eq!(&*rx.recv().await.unwrap().body, "long");
+        assert_eq!(&*rx.recv().await.unwrap().body, "none");
+        assert_eq!(settle(&b, "q").await, stats(0, 2, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_ttl_applies_and_max_ttl_caps() {
+        let b = timed(0, Some(5), Some(10));
+        b.publish("q", body("default"), None).await.unwrap();
+        b.publish("q", body("capped"), Some(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+        b.publish("q", body("own"), Some(Duration::from_secs(7)))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let (_, mut rx) = subscriber(&b, "q", 2).await;
+        assert_eq!(&*rx.recv().await.unwrap().body, "capped");
+        assert_eq!(&*rx.recv().await.unwrap().body, "own");
+        assert_eq!(settle(&b, "q").await, stats(0, 2, 1));
+
+        let b = timed(0, Some(5), Some(10));
+        b.publish("q", body("capped"), Some(Duration::from_secs(3600)))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let (_, _rx) = subscriber(&b, "q", 2).await;
+        assert_eq!(
+            settle(&b, "q").await,
+            stats(0, 0, 1),
+            "max_ttl caps at 10 s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unacked_never_expires_but_is_checked_after_requeue() {
+        let b = timed(0, None, None);
+        let (c, mut rx) = subscriber(&b, "q", 2).await;
+        b.publish("q", body("a"), Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(settle(&b, "q").await, stats(0, 1, 0), "held: not expired");
+        b.consumer_gone("q", c).await;
+        let (_, mut rx2) = subscriber(&b, "q", 2).await;
+        assert_eq!(
+            settle(&b, "q").await,
+            stats(0, 0, 1),
+            "requeued, then expired"
+        );
+        assert_eq!(rx2.try_recv(), Err(TryRecvError::Empty));
     }
 
     /// Many producers and competing consumers on one queue: every message is delivered
@@ -350,7 +535,9 @@ mod tests {
                 let b = b.clone();
                 tokio::spawn(async move {
                     for i in 0..PER_PRODUCER {
-                        b.publish("q", format!("{p}:{i}").into()).await.unwrap();
+                        b.publish("q", format!("{p}:{i}").into(), None)
+                            .await
+                            .unwrap();
                     }
                 })
             })
