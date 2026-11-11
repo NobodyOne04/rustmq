@@ -1,0 +1,69 @@
+# 0012. CLI and config: four subcommands, settings validated in `config`
+
+- Status: Accepted
+- Date: 2026-11-11
+
+The `rustmq` binary gets `server`, `publish`, `consume` and `status`. Every SPEC §14.4 setting
+is a `server` flag, checked in a `config` module before anything starts. This makes the
+broker a standalone executable (SPEC §12.1).
+
+## Technical details
+
+**Problem.** The library is complete, but `rustmq` only prints `--help`: no way to run the
+broker or talk to it by hand (SPEC §6, §14.5, DoD §12.1). Settings are only checked by
+accident; e.g. `max_subscriptions × prefetch` sizes a channel and can overflow.
+
+**Subcommands** (`src/main.rs`, clap derive; still only CLI wiring, [0001](0001-single-crate-lib-and-bin.adr)):
+- `rustmq server [--bind 127.0.0.1:7000] [--max-connections 1024] [--max-message-size 65536]
+  [--max-queues 1024] [--max-queue-len 10000] [--max-total-bytes 268435456]
+  [--max-queue-name-len 255] [--max-subscriptions 16] [--prefetch 1] [--ack-timeout-ms 30000]
+  [--default-ttl-ms N] [--max-ttl-ms N] [--shutdown-timeout-ms 5000] [--log info]`:
+  binds, logs the address, runs `server::run` until Ctrl-C ([0007](0007-graceful-shutdown.adr)).
+- `rustmq publish --address A --queue Q --message M [--ttl-ms N]`: prints the `message_id`.
+- `rustmq consume --address A --queue Q [--count N]`: prints each body on its own line to
+  stdout, then ACKs it; exits after N messages, or runs until Ctrl-C.
+- `rustmq status --address A`: prints each STATS metric as `name: value`.
+- Clients use `client::Client` ([0011](0011-client-library.adr)). `--address` defaults to
+  `127.0.0.1:7000`.
+
+**Config** (`src/config.rs`, no clap in it):
+- `Config` holds the settings with the §14.4 defaults (`Default`), durations as
+  `Duration`, TTLs as `Option<Duration>`.
+- `Config::validate(self) -> Result<(BrokerConfig, ServerConfig), ConfigError>`:
+  - every count and size at least 1;
+  - `max_message_size` at most 16 MiB (SPEC §14.4); frame size derived as
+    `max_message_size + ENVELOPE_OVERHEAD`;
+  - `max_subscriptions × prefetch` at most 1 048 576 (the per-connection delivery channel),
+    checked with `checked_mul`;
+  - `default_ttl` not above `max_ttl` when both are set.
+- `ConfigError` ([0009](0009-typed-errors.adr)) names the setting and the rule; `main` prints
+  it and exits non-zero.
+
+**Runtime and logs.**
+- `#[tokio::main]` (multi-thread). Adds tokio features `rt-multi-thread` and `signal`.
+- `tracing-subscriber` moves from dev- to normal dependency ([0008](0008-observability.adr));
+  `fmt` to stderr, level from `--log` (`error|warn|info|debug|trace`) via
+  `with_max_level`. No `env-filter` (it would pull in `regex`).
+
+**Docs.** `README.md` gets a usage section (DoD §12.12); PROTOCOL.md's "Try it by hand" stays.
+
+**Tests.** `config` gets unit tests for every rule. The CLI wiring is checked by hand
+(server, publish, consume `--count`, status, Ctrl-C), as [0010](0010-test-strategy.adr) says.
+
+**Consequences.**
+- A bad setting fails at start with a clear message, never as a panic later.
+- `consume` prints raw bodies: a body containing a newline spans lines (fine for manual use;
+  scripts should use the library).
+- Only Ctrl-C (SIGINT) stops the server, not SIGTERM.
+
+## Technologies and alternatives
+- Involved: clap 4 (derive, already a dependency), tokio (`rt-multi-thread`, `signal`),
+  tracing-subscriber 0.3 (`fmt`).
+- Alternatives:
+  - A config file (TOML): a new dependency and a second source of truth for a handful of flags.
+  - Validation inside the clap structs: ties the rules to the CLI, so tests and other callers
+    can't reuse them.
+  - `EnvFilter` / `RUST_LOG`: per-module levels, at the cost of `regex`.
+  - Also handling SIGTERM: needed under systemd/Docker, not for this local, educational use.
+  - A separate `ack` command: an ack only counts on the connection that got the message
+    (SPEC §14.5).

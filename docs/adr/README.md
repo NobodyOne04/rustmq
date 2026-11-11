@@ -15,3 +15,4 @@ Files are `NNNN-title.adr` (Markdown). Lower numbers are implemented first, one 
 | [0009](0009-typed-errors.adr) | Errors: one enum per module, mapped to protocol codes at the edge | Accepted |
 | [0010](0010-test-strategy.adr) | Tests: in-process server, reply-driven sync, paused clock | Accepted |
 | [0011](0011-client-library.adr) | Client: a typed, single-owner client in the library | Accepted |
+| [0012](0012-cli-and-config.adr) | CLI and config: four subcommands, settings validated in `config` | Accepted |
