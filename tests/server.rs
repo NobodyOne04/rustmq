@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rustmq::broker::{Broker, BrokerConfig};
 use rustmq::protocol::{Limits, read_frame};
-use rustmq::server::{ServerConfig, run};
+use rustmq::server::{ServerConfig, ServerError, run};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -48,7 +48,7 @@ async fn start_with(
 struct Server {
     addr: std::net::SocketAddr,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<std::io::Result<()>>,
+    task: JoinHandle<Result<(), ServerError>>,
 }
 
 impl Server {
@@ -77,7 +77,7 @@ impl Server {
     }
 
     /// Signals shutdown and waits for `run` to return.
-    async fn shut_down(self) -> std::io::Result<()> {
+    async fn shut_down(self) -> Result<(), ServerError> {
         self.stop.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), self.task)
             .await
