@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `rustmq server`, `publish`, `consume` and `status` commands; every server limit is a flag, checked at start
 - Typed client in the library (`rustmq::client`): connect, publish, subscribe, next message, ack, stats
 - Tests over TCP for FIFO order and for many producers and competing consumers on several queues
 - Structured logs (`tracing`, never message bodies) and runtime metrics in the STATS response

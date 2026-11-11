@@ -11,12 +11,13 @@ clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
+# The server's log output (ADR 0012); `fmt` only, no `env-filter` (it would pull in `regex`).
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
+tokio = { version = "1.54.1", features = ["test-util"] }

@@ -9,13 +9,15 @@ cargo fmt --check                                   # CI
 cargo clippy --all-targets --locked -- -D warnings  # CI
 cargo test --locked                                 # CI
 cargo run -- --help
+cargo run -- server --log debug                     # then publish/consume/status in another terminal
 ```
 
 ## Layout
 - `docs/SPEC.md`: the project specification (scope, non-goals, Definition of Done)
 - `docs/PROTOCOL.md`: the wire protocol, language-neutral; keep it in sync with `src/protocol.rs`
 - `docs/adr/`: architecture decision records (`NNNN-title.adr`), index in its README
-- `src/lib.rs`: everything; `src/main.rs`: only the clap CLI (ADR 0001)
+- `src/lib.rs`: everything; `src/main.rs`: only the clap CLI (ADR 0001, 0012)
+- `src/config.rs`: server settings, defaults and `validate()`; clap defaults read from it
 - `src/broker.rs`: queue registry; `src/broker/queue.rs`: the per-queue actor (ADR 0003)
 - `src/client.rs`: the typed client, one request in flight (ADR 0011)
 - `src/metrics.rs`: shared atomic counters, read by STATS (ADR 0008)
