@@ -26,18 +26,22 @@ fn limits(prefetch: usize, max_subscriptions: usize) -> Limits {
 
 /// Starts a server on a free port; returns its address.
 async fn start(limits: Limits) -> std::net::SocketAddr {
-    start_with(limits, BrokerConfig::default()).await
+    start_with(limits, BrokerConfig::default(), 1024).await
 }
 
 /// Like `start`, with these queue settings (`prefetch` comes from `limits`).
-async fn start_with(limits: Limits, config: BrokerConfig) -> std::net::SocketAddr {
+async fn start_with(
+    limits: Limits,
+    config: BrokerConfig,
+    max_connections: usize,
+) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let broker = Arc::new(Broker::with_config(BrokerConfig {
         prefetch: limits.prefetch,
         ..config
     }));
-    tokio::spawn(serve(listener, broker, limits));
+    tokio::spawn(serve(listener, broker, limits, max_connections));
     addr
 }
 
@@ -356,7 +360,7 @@ async fn ack_after_timeout_is_unknown() {
         ack_timeout: Duration::from_millis(50),
         ..BrokerConfig::default()
     };
-    let addr = start_with(limits(1, 16), config).await;
+    let addr = start_with(limits(1, 16), config, 1024).await;
     let mut producer = Client::hello(addr).await;
     let mut consumer = Client::hello(addr).await;
     consumer.subscribe("q").await;
@@ -385,4 +389,61 @@ async fn ack_after_timeout_is_unknown() {
         r["type"] == "RESPONSE" || code(&r) == "UNKNOWN_DELIVERY",
         "{r}"
     );
+}
+
+#[tokio::test]
+async fn connection_limit() {
+    let addr = start_with(limits(1, 16), BrokerConfig::default(), 2).await;
+    let mut a = Client::hello(addr).await;
+    let _b = Client::hello(addr).await;
+
+    // The third already sent HELLO when it is rejected; it must still read the ERROR.
+    let mut c = Client::connect(addr).await;
+    c.send(json!({"type": "HELLO", "versions": [1]})).await;
+    assert_eq!(code(&c.recv().await.unwrap()), "TOO_MANY_CONNECTIONS");
+    assert!(c.recv().await.is_none(), "closed");
+
+    // Accepted connections are unaffected.
+    assert_eq!(
+        a.request(json!({"type": "STATS"})).await["type"],
+        "RESPONSE"
+    );
+
+    // A slot frees when a connection ends. The server notices the close on its own time,
+    // so retry; each attempt is a full round trip, not a sleep.
+    drop(a);
+    for attempt in 0.. {
+        let mut d = Client::connect(addr).await;
+        // Not `request`: a rejection has no `request_id` to match.
+        d.send(json!({"type": "HELLO", "versions": [1]})).await;
+        let r = d.recv().await.expect("an answer before the close");
+        if r["type"] == "RESPONSE" {
+            break;
+        }
+        assert_eq!(code(&r), "TOO_MANY_CONNECTIONS");
+        assert!(attempt < 1000, "slot never freed");
+    }
+}
+
+#[tokio::test]
+async fn broker_limits_reach_the_client() {
+    let config = BrokerConfig {
+        max_queues: 1,
+        max_queue_len: 1,
+        ..BrokerConfig::default()
+    };
+    let addr = start_with(limits(1, 16), config, 1024).await;
+    let mut c = Client::hello(addr).await;
+    c.publish("q", "a").await;
+    let r = c
+        .request(json!({"type": "PUBLISH", "queue": "q", "body": "b"}))
+        .await;
+    assert_eq!(code(&r), "QUEUE_FULL");
+    let r = c
+        .request(json!({"type": "SUBSCRIBE", "queue": "other"}))
+        .await;
+    assert_eq!(code(&r), "TOO_MANY_QUEUES");
+    // still open, and the failed SUBSCRIBE used no subscription slot
+    c.subscribe("q").await;
+    assert_eq!(c.message().await["body"], "a");
 }

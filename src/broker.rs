@@ -3,13 +3,13 @@
 mod queue;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use queue::{Command, QueueActor};
+use queue::{Command, QueueActor, Reservation};
 pub use queue::{Delivery, QueueStats};
 
 /// Commands waiting per queue before senders have to wait (back-pressure on producers).
@@ -29,6 +29,12 @@ pub struct BrokerConfig {
     pub default_ttl: Option<Duration>,
     /// Upper bound for any message's TTL.
     pub max_ttl: Option<Duration>,
+    /// Queues that may exist; they are never deleted in v1.
+    pub max_queues: usize,
+    /// Ready (not handed out) messages per queue.
+    pub max_queue_len: usize,
+    /// Body bytes of all messages held, ready or unacked, across all queues.
+    pub max_total_bytes: usize,
 }
 
 impl Default for BrokerConfig {
@@ -38,6 +44,9 @@ impl Default for BrokerConfig {
             ack_timeout: Duration::from_secs(30),
             default_ttl: None,
             max_ttl: None,
+            max_queues: 1024,
+            max_queue_len: 10_000,
+            max_total_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -48,6 +57,10 @@ pub enum BrokerError {
     UnknownDelivery,
     #[error("queue task has stopped")]
     QueueStopped,
+    #[error("queue at its length limit, or the broker at its byte limit")]
+    QueueFull,
+    #[error("creating the queue would pass the queue limit")]
+    TooManyQueues,
 }
 
 pub struct Broker {
@@ -57,6 +70,9 @@ pub struct Broker {
     queues: Mutex<HashMap<Arc<str>, mpsc::Sender<Command>>>,
     message_ids: Arc<AtomicU64>,
     consumer_ids: AtomicU64,
+    /// Body bytes held by all queues (ADR 0006): reserved here before a publish, released
+    /// when the message is dropped (see `Reservation`).
+    held_bytes: Arc<AtomicUsize>,
 }
 
 impl Broker {
@@ -77,6 +93,7 @@ impl Broker {
             queues: Mutex::new(HashMap::new()),
             message_ids: Arc::new(AtomicU64::new(0)),
             consumer_ids: AtomicU64::new(0),
+            held_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -93,10 +110,20 @@ impl Broker {
         body: Arc<str>,
         ttl: Option<Duration>,
     ) -> Result<u64, BrokerError> {
+        let bytes = Reservation::take(&self.held_bytes, body.len(), self.config.max_total_bytes)
+            .ok_or(BrokerError::QueueFull)?;
         let (reply, rx) = oneshot::channel();
-        self.send(queue, Command::Publish { body, ttl, reply })
-            .await?;
-        rx.await.map_err(|_| BrokerError::QueueStopped)
+        self.send(
+            queue,
+            Command::Publish {
+                body,
+                ttl,
+                bytes,
+                reply,
+            },
+        )
+        .await?;
+        rx.await.map_err(|_| BrokerError::QueueStopped)?
     }
 
     /// Starts delivering `queue`'s messages to `tx`. `tx` must hold at least `prefetch`
@@ -163,24 +190,28 @@ impl Broker {
 
     async fn send(&self, queue: &str, command: Command) -> Result<(), BrokerError> {
         // The lock guard is dropped at the end of this statement, before the `.await`.
-        let tx = self.queue(queue);
+        let tx = self.queue(queue)?;
         tx.send(command)
             .await
             .map_err(|_| BrokerError::QueueStopped)
     }
 
-    /// The queue's command sender, starting its task on first use.
-    fn queue(&self, name: &str) -> mpsc::Sender<Command> {
+    /// The queue's command sender, starting its task on first use if the limit allows.
+    fn queue(&self, name: &str) -> Result<mpsc::Sender<Command>, BrokerError> {
         let mut queues = self.queues.lock().expect("registry lock poisoned");
         if let Some(tx) = queues.get(name) {
-            return tx.clone();
+            return Ok(tx.clone());
+        }
+        // Checked under the same lock as the insert, so two first uses can't both pass.
+        if queues.len() >= self.config.max_queues {
+            return Err(BrokerError::TooManyQueues);
         }
         let name: Arc<str> = name.into();
         let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
         let actor = QueueActor::new(name.clone(), self.config, self.message_ids.clone());
         tokio::spawn(actor.run(rx));
         queues.insert(name, tx.clone());
-        tx
+        Ok(tx)
     }
 }
 
@@ -377,6 +408,7 @@ mod tests {
             ack_timeout: Duration::from_secs(ack_timeout_s),
             default_ttl: default_ttl_s.map(Duration::from_secs),
             max_ttl: max_ttl_s.map(Duration::from_secs),
+            ..BrokerConfig::default()
         })
     }
 
@@ -517,8 +549,7 @@ mod tests {
         let b = Broker::with_config(BrokerConfig {
             prefetch: 1,
             ack_timeout: Duration::MAX,
-            default_ttl: None,
-            max_ttl: None,
+            ..BrokerConfig::default()
         });
         b.publish("q", body("a"), Some(Duration::from_millis(u64::MAX)))
             .await
@@ -532,6 +563,122 @@ mod tests {
             stats(0, 1, 0),
             "the queue task is alive"
         );
+    }
+
+    fn limited(max_queues: usize, max_queue_len: usize, max_total_bytes: usize) -> Broker {
+        Broker::with_config(BrokerConfig {
+            max_queues,
+            max_queue_len,
+            max_total_bytes,
+            ..BrokerConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn queue_count_is_limited() {
+        let b = limited(2, 10, 1000);
+        b.publish("a", body("x"), None).await.unwrap();
+        let (_, _rx) = subscriber(&b, "b", 1).await;
+        assert_eq!(
+            b.publish("c", body("x"), None).await,
+            Err(BrokerError::TooManyQueues)
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        assert_eq!(
+            b.subscribe("c", b.new_consumer_id(), tx).await,
+            Err(BrokerError::TooManyQueues)
+        );
+        // existing queues still work
+        b.publish("a", body("y"), None).await.unwrap();
+        assert_eq!(b.queue_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_length_counts_ready_messages() {
+        let b = limited(10, 2, 1000);
+        b.publish("q", body("a"), None).await.unwrap();
+        b.publish("q", body("b"), None).await.unwrap();
+        assert_eq!(
+            b.publish("q", body("c"), None).await,
+            Err(BrokerError::QueueFull)
+        );
+        // another queue has its own length
+        b.publish("other", body("c"), None).await.unwrap();
+        // handing one out makes room: unacked messages don't count
+        let (_, mut rx) = subscriber(&b, "q", 1).await;
+        rx.recv().await.unwrap();
+        b.publish("q", body("c"), None).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_bytes_are_released_by_ack_expiry_and_rejection() {
+        let b = limited(10, 1, 10);
+        b.publish("a", body("12345"), None).await.unwrap();
+        b.publish("b", body("12345"), Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.publish("c", body("1"), None).await,
+            Err(BrokerError::QueueFull),
+            "10 of 10 bytes held"
+        );
+
+        // ACK releases
+        let (c, mut rx) = subscriber(&b, "a", 1).await;
+        let d = rx.recv().await.unwrap();
+        assert_eq!(
+            b.publish("c", body("1"), None).await,
+            Err(BrokerError::QueueFull),
+            "unacked still holds its bytes"
+        );
+        b.ack("a", c, d.tag).await.unwrap();
+        b.publish("c", body("1"), None).await.unwrap(); // 6 of 10 held: b, c
+
+        // Rejected by the queue's length limit (the bytes fit): they must come back.
+        assert_eq!(
+            b.publish("c", body("1234"), None).await,
+            Err(BrokerError::QueueFull)
+        );
+        b.publish("d", body("1234"), None)
+            .await
+            .expect("fits only if the rejected 4 bytes were released");
+
+        // Expiry releases: "b" (5 bytes) expires when it reaches a consumer.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (_, _rx) = subscriber(&b, "b", 1).await;
+        assert_eq!(settle(&b, "b").await, stats(0, 0, 1));
+        b.publish("a", body("12345"), None).await.unwrap();
+        assert_eq!(
+            b.publish("e", body("1"), None).await,
+            Err(BrokerError::QueueFull),
+            "10 of 10 again: a, c, d"
+        );
+    }
+
+    /// Many publishers race for the last bytes: exactly as many succeed as fit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn byte_limit_holds_under_concurrency() {
+        let b = Arc::new(limited(100, 10_000, 1000));
+        let tasks: Vec<_> = (0..50)
+            .map(|i| {
+                let b = b.clone();
+                tokio::spawn(async move {
+                    let mut ok = 0;
+                    for _ in 0..10 {
+                        let q = format!("q{}", i % 4);
+                        if b.publish(&q, body("0123456789"), None).await.is_ok() {
+                            ok += 1;
+                        }
+                    }
+                    ok
+                })
+            })
+            .collect();
+        let mut accepted = 0;
+        for t in tasks {
+            accepted += t.await.unwrap();
+        }
+        assert_eq!(accepted, 100, "1000 bytes / 10 per message");
     }
 
     /// Many producers and competing consumers on one queue: every message is delivered

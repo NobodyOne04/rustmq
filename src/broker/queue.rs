@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 // Rust note: tokio's `Instant`, not std's: tests pause and advance tokio's clock, which
@@ -40,7 +40,9 @@ pub(super) enum Command {
         body: Arc<str>,
         /// The client's TTL, if it gave one.
         ttl: Option<Duration>,
-        reply: oneshot::Sender<u64>,
+        bytes: Reservation,
+        /// The message id, or `QueueFull`.
+        reply: oneshot::Sender<Result<u64, BrokerError>>,
     },
     Subscribe {
         consumer: ConsumerId,
@@ -60,6 +62,43 @@ pub(super) enum Command {
     },
 }
 
+/// A message's share of the broker-wide byte limit (ADR 0006), given back when dropped.
+// Rust note: releasing in `Drop` means every way a message can go (ACK, expiry, a rejected
+// or cancelled publish, the queue task ending) gives the bytes back; none can forget to.
+pub(super) struct Reservation {
+    size: usize,
+    held: Arc<AtomicUsize>,
+}
+
+impl Reservation {
+    /// Takes `size` bytes if the total stays within `max`.
+    pub(super) fn take(held: &Arc<AtomicUsize>, size: usize, max: usize) -> Option<Self> {
+        // Rust note: a compare-and-swap loop. `compare_exchange_weak` stores the new total
+        // only if the counter still holds `current`; if another publish changed it in
+        // between, retry with the fresh value, so two can't both take the last bytes.
+        // (`fetch_update` does the same but is deprecated on newer Rust.) Relaxed: the
+        // counter guards no other memory.
+        let mut current = held.load(Ordering::Relaxed);
+        loop {
+            let total = current.checked_add(size).filter(|&total| total <= max)?;
+            match held.compare_exchange_weak(current, total, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        Some(Self {
+            size,
+            held: held.clone(),
+        })
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.size, Ordering::Relaxed);
+    }
+}
+
 // Rust note: `Arc<str>` is a shared, immutable string. Cloning it copies a pointer, not the
 // body, so keeping a message in `unacked` and sending it to a consumer costs no copy.
 struct Message {
@@ -68,6 +107,8 @@ struct Message {
     redelivered: bool,
     /// Dropped instead of handed out from this moment on.
     expires_at: Option<Instant>,
+    /// Held as long as the message is; never read.
+    _bytes: Reservation,
 }
 
 struct Consumer {
@@ -138,7 +179,17 @@ impl QueueActor {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Publish { body, ttl, reply } => {
+            Command::Publish {
+                body,
+                ttl,
+                bytes,
+                reply,
+            } => {
+                if self.ready.len() >= self.config.max_queue_len {
+                    // Dropping `bytes` here gives them back.
+                    let _ = reply.send(Err(BrokerError::QueueFull));
+                    return;
+                }
                 // Relaxed is enough: the counter only has to hand out distinct, increasing
                 // numbers; nothing else is synchronized through it.
                 let id = self.message_ids.fetch_add(1, Ordering::Relaxed) + 1;
@@ -153,9 +204,10 @@ impl QueueActor {
                     // `checked_add`: `+` panics past the clock's range, and `ttl_ms` comes
                     // from the client (u64::MAX ms would kill this task). Too far = never.
                     expires_at: ttl.and_then(|ttl| Instant::now().checked_add(ttl)),
+                    _bytes: bytes,
                 });
                 // The producer may have gone; the message stays queued either way.
-                let _ = reply.send(id);
+                let _ = reply.send(Ok(id));
             }
             Command::Subscribe {
                 consumer,
