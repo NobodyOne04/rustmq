@@ -414,7 +414,9 @@ async fn connection_limit() {
     drop(a);
     for attempt in 0.. {
         let mut d = Client::connect(addr).await;
-        let r = d.request(json!({"type": "HELLO", "versions": [1]})).await;
+        // Not `request`: a rejection has no `request_id` to match.
+        d.send(json!({"type": "HELLO", "versions": [1]})).await;
+        let r = d.recv().await.expect("an answer before the close");
         if r["type"] == "RESPONSE" {
             break;
         }
