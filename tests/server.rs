@@ -565,3 +565,43 @@ async fn shutdown_timeout_aborts_stuck_connections() {
     }
     assert!(frames <= PREFETCH + 100 + 1, "{frames}");
 }
+
+#[tokio::test]
+async fn stats_reports_the_counters() {
+    let addr = start(limits(1, 16)).await;
+    let mut admin = Client::hello(addr).await;
+    let mut producer = Client::hello(addr).await;
+    producer.publish("q", "a").await;
+    producer.publish("q", "b").await;
+    producer.publish("r", "waits").await;
+
+    let mut first = Client::hello(addr).await;
+    first.subscribe("q").await;
+    let a = first.message().await;
+    first.ack(&a["delivery_id"]).await;
+    first.message().await; // "b", never acked
+    drop(first);
+    let mut second = Client::hello(addr).await;
+    second.subscribe("q").await;
+    let b = second.message().await;
+    assert_eq!(b["redelivered"], true);
+    second.ack(&b["delivery_id"]).await;
+
+    // `first`'s connection may still be finishing; the gauge drops when it has.
+    let mut stats;
+    for attempt in 0.. {
+        stats = admin.request(json!({"type": "STATS"})).await["stats"].clone();
+        if stats["active_connections"] == 3 {
+            assert_eq!(
+                stats,
+                json!({
+                    "active_connections": 3, "queues": 2, "published": 3, "delivered": 3,
+                    "acked": 2, "redelivered": 1, "expired": 0, "queued": 1
+                })
+            );
+            return;
+        }
+        assert_eq!(stats["active_connections"], 4, "{stats}");
+        assert!(attempt < 1000, "gauge never dropped");
+    }
+}

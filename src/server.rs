@@ -14,6 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::broker::{Broker, BrokerError, ConsumerId, Delivery};
+use crate::metrics::Metrics;
 use crate::protocol::{
     ErrorCode, Limits, ProtocolError, Request, ServerFrame, Stats, decode, negotiate, read_frame,
     write_frame,
@@ -62,23 +63,29 @@ pub async fn run(
         tokio::select! {
             () = &mut shutdown => break Ok(()),
             accepted = listener.accept() => {
-                // shortcut: an accept error (e.g. out of file descriptors) stops the
-                // server; ADR 0008 adds the log to tell why.
-                let (stream, _peer) = match accepted {
+                // An accept error (e.g. out of file descriptors) stops the server.
+                let (stream, peer) = match accepted {
                     Ok(a) => a,
-                    Err(e) => break Err(e),
+                    Err(e) => {
+                        tracing::error!(error = %e, "accept failed, shutting down");
+                        break Err(e);
+                    }
                 };
                 // Rust note: an owned permit can move into the task; dropping it when the
                 // task ends frees the slot, whichever way the connection ends.
                 match slots.clone().try_acquire_owned() {
                     Ok(permit) => connections.spawn(connection(
                         stream,
+                        peer,
                         broker.clone(),
                         config.limits.clone(),
                         permit,
                         stop.clone(),
                     )),
-                    Err(_) => connections.spawn(reject(stream)),
+                    Err(_) => {
+                        tracing::info!(%peer, "too many connections, rejected");
+                        connections.spawn(reject(stream))
+                    }
                 };
             }
             // Finished tasks stay in a JoinSet until joined: reap them as they end.
@@ -86,8 +93,10 @@ pub async fn run(
         }
     };
 
-    // shortcut: ADR 0007 also logs shutdown start, connections left and a hit timeout;
-    // that needs `tracing` (ADR 0008).
+    tracing::info!(
+        connections = connections.len(),
+        "shutdown: closing connections"
+    );
     drop(listener); // refuse new connections right away
     let _ = stop_tx.send(true);
     let drained = tokio::time::timeout(config.shutdown_timeout, async {
@@ -96,9 +105,15 @@ pub async fn run(
     .await;
     if drained.is_err() {
         // A connection stuck on a client (e.g. a write to one that doesn't read).
+        tracing::warn!(
+            left = connections.len(),
+            timeout = ?config.shutdown_timeout,
+            "shutdown timeout, aborting connections"
+        );
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
+    tracing::info!("shutdown complete");
     result
 }
 
@@ -119,6 +134,7 @@ async fn reject(mut stream: TcpStream) {
 
 async fn connection(
     stream: TcpStream,
+    peer: std::net::SocketAddr,
     broker: Arc<Broker>,
     limits: Limits,
     _permit: OwnedSemaphorePermit,
@@ -133,6 +149,9 @@ async fn connection(
     let mut writer = AbortOnDrop(tokio::spawn(write_loop(write, outbound_rx)));
 
     let consumer = broker.new_consumer_id();
+    // The connection id in logs is its consumer id: the queues' logs name the same number.
+    tracing::info!(conn = consumer, %peer, "connect");
+    let _gauge = ActiveConnection::new(broker.metrics().clone());
     // Every queue's credit (`prefetch`) bounds what it can have in this channel, so it never
     // fills unless a queue misbehaves; then that queue drops us as too slow (ADR 0003).
     let (deliveries_tx, deliveries) =
@@ -155,6 +174,26 @@ async fn connection(
     // Dropping the last sender lets the writer send what is queued, then finish and close.
     drop(conn);
     let _ = (&mut writer.0).await;
+    tracing::info!(conn = consumer, "disconnect");
+}
+
+/// Counts the connection in `active_connections` while it lives; `Drop` also covers a
+/// connection aborted at the shutdown timeout.
+struct ActiveConnection(Arc<Metrics>);
+
+impl ActiveConnection {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Metrics::add(&metrics.active_connections);
+        Self(metrics)
+    }
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0
+            .active_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Aborts the task when dropped (a plain `JoinHandle` lets it run on).
@@ -216,6 +255,7 @@ impl Connection {
                         Err(ProtocolError::Io(_)) => Next::Close,
                         // The stream is mid-frame: say why, then close (PROTOCOL.md).
                         Err(e) => {
+                            tracing::info!(conn = self.consumer, error = %e, "protocol error, closing");
                             let _ = self.outbound.send(ServerFrame::error(None, e.code())).await;
                             Next::Close
                         }
@@ -238,6 +278,7 @@ impl Connection {
         let request = match decode::<Request>(frame) {
             Ok(r) => r,
             Err(e) => {
+                tracing::info!(conn = self.consumer, error = %e, "bad frame");
                 let next = if *hello_done {
                     Next::Continue
                 } else {
@@ -272,7 +313,15 @@ impl Connection {
         }
         let answer = match self.handle(request).await {
             Ok(frame) => frame,
-            Err(code) => ServerFrame::error(Some(id), code),
+            Err(code) => {
+                tracing::debug!(
+                    conn = self.consumer,
+                    request_id = id,
+                    ?code,
+                    "request refused"
+                );
+                ServerFrame::error(Some(id), code)
+            }
         };
         self.reply(answer, Next::Continue).await
     }
@@ -329,17 +378,26 @@ impl Connection {
                     .map_err(broker_code)?;
                 Ok(ServerFrame::ok(request_id))
             }
-            Request::Stats { request_id } => Ok(ServerFrame::Response {
-                request_id,
-                version: None,
-                limits: None,
-                message_id: None,
-                // shortcut: only `queues` is filled; ADR 0008 adds the counters.
-                stats: Some(Stats {
+            Request::Stats { request_id } => {
+                let m = self.broker.metrics();
+                let stats = Stats {
+                    active_connections: Metrics::get(&m.active_connections),
                     queues: self.broker.queue_count() as u64,
-                    ..Stats::default()
-                }),
-            }),
+                    published: Metrics::get(&m.published),
+                    delivered: Metrics::get(&m.delivered),
+                    acked: Metrics::get(&m.acked),
+                    redelivered: Metrics::get(&m.redelivered),
+                    expired: Metrics::get(&m.expired),
+                    queued: self.broker.queued().await,
+                };
+                Ok(ServerFrame::Response {
+                    request_id,
+                    version: None,
+                    limits: None,
+                    message_id: None,
+                    stats: Some(stats),
+                })
+            }
         }
     }
 
@@ -393,7 +451,11 @@ impl Connection {
 fn broker_code(e: BrokerError) -> ErrorCode {
     match e {
         BrokerError::UnknownDelivery => ErrorCode::UnknownDelivery,
-        BrokerError::QueueStopped => ErrorCode::Internal,
+        BrokerError::QueueStopped => {
+            // Not the client's fault and not its business: details go to the log only.
+            tracing::error!(error = %e, "internal error");
+            ErrorCode::Internal
+        }
         BrokerError::QueueFull => ErrorCode::QueueFull,
         BrokerError::TooManyQueues => ErrorCode::TooManyQueues,
     }

@@ -1,0 +1,38 @@
+# 0008. Observability: tracing logs and atomic counters read via STATS
+
+- Status: Accepted
+- Date: 2026-11-11
+
+Structured logs through `tracing`, and a handful of atomic counters a client reads with STATS
+(`rustmq status`). No metrics stack.
+
+## Technical details
+
+**Problem.** The spec requires structured logs for connection, queue and message events, a
+set of runtime metrics, no message bodies in logs, and no Prometheus without reason (SPEC §9).
+
+**Logs.**
+- `tracing` events with fields (`conn`, `queue`, `message_id`, `delivery_id`, `bytes`) for:
+  connect/disconnect, queue created, publish, deliver, ack, redeliver, expire, protocol
+  error, shutdown. Bodies are never logged.
+- `tracing-subscriber` `fmt` layer prints them; the level comes from `--log` (default `info`).
+
+**Metrics** (`src/metrics.rs`).
+- Counters: `published`, `delivered`, `acked`, `redelivered`, `expired`,
+  `active_connections`, as `AtomicU64` in one `Arc<Metrics>`, updated with `Relaxed`.
+- Gauges: `queues` from `Broker::queue_count`, `queued` summed from each queue's
+  `Stats` command when STATS arrives.
+- Sent as `Stats` in the STATS response ([0002](0002-wire-protocol-ndjson.adr)); printed by
+  `rustmq status`.
+
+**Consequences.**
+- Counters read together may be from slightly different moments.
+- STATS costs one message per queue.
+
+## Technologies and alternatives
+- Involved: tracing 0.1, tracing-subscriber 0.3 (`fmt`): the one dependency beyond the
+  spec's list, since `tracing` only records events and something must print them.
+- Alternatives:
+  - `metrics` crate or a Prometheus endpoint: a dependency and an HTTP server for numbers a
+    CLI command can print.
+  - Counters inside each actor only: every STATS would need a round trip to every queue.
