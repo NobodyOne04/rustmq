@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Graceful shutdown: stop accepting, close every connection, wait at most `shutdown_timeout`, then abort
 - Resource limits: connections, queues, queue length and total bytes held, each with its own error
 - Ack timeout (unacked deliveries go back to the front) and message TTL, both checked by the queue's own task
 - TCP server: a reader and a writer task per connection, so a client that stops reading slows only itself

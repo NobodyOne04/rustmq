@@ -10,3 +10,4 @@ Files are `NNNN-title.adr` (Markdown). Lower numbers are implemented first, one 
 | [0004](0004-connection-reader-writer.adr) | Connections: separate reader and writer; queues never wait on a socket | Accepted |
 | [0005](0005-delivery-state-requeue-ttl.adr) | Delivery state: ack timeout and TTL in the queue actor | Accepted |
 | [0006](0006-resource-limits.adr) | Resource limits: where each one is enforced | Accepted |
+| [0007](0007-graceful-shutdown.adr) | Graceful shutdown: a watch channel, a JoinSet and a timeout | Accepted |

@@ -1,0 +1,33 @@
+# 0007. Graceful shutdown: a watch channel, a JoinSet and a timeout
+
+- Status: Accepted
+- Date: 2026-11-11
+
+Shutdown is one signal every task watches, plus a bounded wait for connections to finish. It
+uses only tokio, and tests can trigger it.
+
+## Technical details
+
+**Problem.** Shutdown must cancel background tasks and close active connections without
+hanging (SPEC §2.1, §7). Messages are lost at shutdown, accepted as tech debt (§14.7).
+
+**How it works.**
+- `server::run(config, shutdown)` takes the signal as an argument; `main` passes
+  `tokio::signal::ctrl_c()`, tests pass their own future.
+- On the signal: a `tokio::sync::watch` channel flips to `true`. The accept loop stops; each
+  connection's reader has a branch for it in its `select!` and exits through the normal
+  end-of-connection path ([0004](0004-connection-reader-writer.adr)).
+- Connection tasks run in a `JoinSet`; `run` waits with `timeout(shutdown_timeout)` (5 s) and
+  aborts whatever is left. Queue actors end when the registry is dropped.
+- Logged: shutdown start, connections left, timeout hit.
+
+**Consequences.**
+- Every long-running loop needs the shutdown branch; a missing one shows up as hitting the
+  timeout in the shutdown test.
+- No draining (tech debt, §14.7).
+
+## Technologies and alternatives
+- Involved: tokio (`sync::watch`, `task::JoinSet`, `time::timeout`, `signal`).
+- Alternatives:
+  - tokio-util `CancellationToken`: nicer API, but an extra dependency for what `watch` does.
+  - Drop everything on exit: no closing frames or logs, and tests can't check it.

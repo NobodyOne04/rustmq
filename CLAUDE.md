@@ -17,7 +17,8 @@ cargo run -- --help
 - `docs/adr/`: architecture decision records (`NNNN-title.adr`), index in its README
 - `src/lib.rs`: everything; `src/main.rs`: only the clap CLI (ADR 0001)
 - `src/broker.rs`: queue registry; `src/broker/queue.rs`: the per-queue actor (ADR 0003)
-- `src/server.rs`: accept loop; per connection a reader and a writer task (ADR 0004)
+- `src/server.rs`: `run(listener, broker, config, shutdown)`, the accept loop and shutdown
+  (ADR 0007); per connection a reader and a writer task (ADR 0004)
 - `tests/`: integration tests, through the library's public API; `tests/server.rs` over real TCP
 
 ## Conventions
