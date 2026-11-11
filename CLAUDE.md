@@ -37,4 +37,5 @@ cargo run -- server --log debug                     # then publish/consume/statu
 - Explain non-obvious Rust choices: this is a learning project.
 - Never log a message body, at any level; log its size (`bytes`). `tests/logs.rs` checks.
 - Deadlines use `tokio::time::Instant`, never `std::time::Instant`: tests pause tokio's
-  clock (`start_paused`, `advance`) and std's would ignore it (ADR 0005).
+  clock (`start_paused`, `advance`) and std's would ignore it (ADR 0005). But not over real
+  TCP: auto-advance can fire a client timeout mid-round-trip; use the real clock (ADR 0013).

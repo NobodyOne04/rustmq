@@ -34,6 +34,7 @@ async fn start() -> std::net::SocketAddr {
         limits: limits(),
         max_connections: 1024,
         shutdown_timeout: Duration::from_secs(5),
+        hello_timeout: Duration::from_secs(10),
     };
     tokio::spawn(run(listener, broker, config, std::future::pending()));
     addr

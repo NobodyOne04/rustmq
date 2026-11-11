@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- HELLO timeout: a connection that doesn't send HELLO within `--hello-timeout-ms` (10 s) is closed
 - `rustmq server`, `publish`, `consume` and `status` commands; every server limit is a flag, checked at start
 - Typed client in the library (`rustmq::client`): connect, publish, subscribe, next message, ack, stats
 - Tests over TCP for FIFO order and for many producers and competing consumers on several queues
