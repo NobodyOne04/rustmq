@@ -1,0 +1,43 @@
+# 0003. Queue concurrency: one task (actor) owns each queue
+
+- Status: Accepted
+- Date: 2026-11-11
+
+## Context
+Many connections publish to, consume from and ack the same queue at once. The spec requires
+FIFO, no message held by two consumers at once, requeue on disconnect, and that one queue
+never blocks another (§2.4, §2.6, §7). Ack timeouts and TTL (§14.3) need timers.
+
+## Decision
+- Each queue is a tokio task that alone owns its state: the ready messages (`VecDeque`), the
+  unacked deliveries, and the subscribed consumers.
+- Others talk to it through a bounded `mpsc` channel of commands (`Publish`, `Subscribe`,
+  `Ack`, `ConsumerGone`, `Stats`). Commands that need an answer carry a `oneshot` reply;
+  PUBLISH is acked to the producer only after the actor replies "accepted".
+- A registry (`broker`) maps queue names to actor handles and creates actors on first use.
+
+## Alternatives
+- **Shared state behind a lock** (`Arc<Mutex<QueueState>>` + `Notify`): fewer moving parts
+  for publish/consume, but ack timeouts need a separate scanner task, requeue on disconnect
+  competes for the same lock, fairness between consumers is up to lock order, and an async
+  mutex invites holding the lock across `.await`.
+- **One global broker task:** simplest ordering, but every queue waits on every other
+  (breaks §2.6).
+
+## Rationale
+With one owner, FIFO and single-holder delivery follow from the code being sequential: no
+lock, no race to reason about. Queues share nothing, so isolation is structural.
+Rust note: "share memory by communicating". The queue state is moved into the task; the
+borrow checker then guarantees no one else touches it, and `Send`-checked channels carry
+the only access.
+
+## Consequences
+- One channel hop per operation; irrelevant at this scale.
+- A bounded command channel gives back-pressure: a fast producer waits, others don't.
+- Actor code must never `.await` on anything a client controls (see
+  [0004](0004-connection-reader-writer.adr)), or a client could stall the queue.
+- Debugging is through logs/state dumps, not by inspecting shared memory.
+
+## References
+SPEC §2.4, §2.6, §7; [0004](0004-connection-reader-writer.adr),
+[0005](0005-delivery-state-requeue-ttl.adr).
