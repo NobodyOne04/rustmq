@@ -371,3 +371,86 @@ Follow these stages:
 - Do not add features outside the agreed scope.
 - Explain non-obvious Rust-specific design decisions so the developer can learn from them.
 - Treat this as a collaborative learning project, not an autonomous code-generation exercise.
+
+---
+
+## 14. Clarifications (Stage 1, agreed 2026-11-11)
+
+Answers to the requirements review. Where they differ from sections 1–13, this section wins.
+
+### 14.1 Delivery semantics
+- **At-least-once.** A message has at most one consumer holding it unacked at a time (§2.4
+  "at-most-one active delivery" means this, not at-most-once delivery). Redelivery can duplicate.
+- **FIFO** is the order messages are handed out. A requeued message goes back to the **front**
+  of its queue. With competing consumers the order they finish processing is not guaranteed.
+- **Requeue** happens when the consumer disconnects or its `ack_timeout` runs out; both count
+  as a redelivery.
+- **Cancelling** a subscription means disconnecting. No UNSUBSCRIBE in v1.
+- A connection can publish and subscribe at once, up to `max_subscriptions` queues.
+
+### 14.2 Protocol
+- **Framing:** newline-delimited JSON, one compact JSON object per line. Frame limit is
+  `max_message_size + 4 KiB`.
+- **Versioning:** the first frame on a connection is `HELLO {versions:[…]}`. The server answers
+  with the chosen version and its limits, or `ERROR UNSUPPORTED_VERSION` and closes.
+- **Message types:** client sends HELLO, PUBLISH, SUBSCRIBE, ACK, STATS; server sends
+  RESPONSE, ERROR, MESSAGE.
+- **Body:** a UTF-8 string the broker never parses; its size in bytes is checked against
+  `max_message_size`.
+- **IDs** (all u64):
+  - `request_id`: picked by the client, echoed in RESPONSE/ERROR, not checked for uniqueness.
+  - `message_id`: picked by the server from one global counter, returned on PUBLISH, carried
+    by every MESSAGE, unchanged on redelivery so consumers can drop duplicates.
+  - `delivery_id`: per connection, new for every delivery. ACK names a `delivery_id`; an
+    unknown or timed-out one gets `ERROR UNKNOWN_DELIVERY`.
+- **Over the connection limit:** an ERROR frame, then close.
+
+### 14.3 Scope changes (approved)
+- **TTL:** PUBLISH may carry `ttl_ms`; otherwise `default_ttl_ms` applies (none by default),
+  capped by `max_ttl_ms`. Expiry is checked only when a message is about to be handed out; a
+  message a consumer holds unacked never expires. Expired messages are dropped and counted
+  in an `expired` metric (no dead-letter queue, §11 still applies).
+- **Ack timeout:** an unacked delivery older than `ack_timeout` is requeued. `0` turns it off.
+- **HELLO** and **STATS** message types; STATS backs a `rustmq status` CLI command for metrics.
+
+### 14.4 Configuration
+Every limit is a setting (CLI flag on `rustmq server`), with these defaults:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `bind` | `127.0.0.1:7000` | |
+| `max_connections` | 1024 | |
+| `max_message_size` | 64 KiB | at most 16 MiB |
+| `max_queues` | 1024 | queues are never deleted in v1 |
+| `max_queue_len` | 10 000 | ready messages per queue; full → `QUEUE_FULL` |
+| `max_total_bytes` | 256 MiB | all queued bodies; full → `QUEUE_FULL` (proposed, see 14.6) |
+| `max_queue_name_len` | 255 | names match `[A-Za-z0-9._-]+` |
+| `max_subscriptions` | 16 | per connection |
+| `prefetch` | 1 | unacked deliveries per subscription |
+| `ack_timeout` | 30 s | `0` = off |
+| `default_ttl_ms` / `max_ttl_ms` | none / none | |
+| `shutdown_timeout` | 5 s | |
+| `log` | `info` | |
+
+### 14.5 CLI
+- `rustmq consume` prints each message, then acks it; `--count N` exits after N messages.
+  There is no separate `ack` command: an ack only counts on the connection that got the message.
+- `rustmq status` prints the metrics (via STATS).
+
+### 14.6 Layout
+One crate: a library (`config`, `protocol`, `broker`, `server`, `client`, `metrics`) and a
+`rustmq` binary that is only the clap CLI. Integration tests in `tests/` use the library and
+the `client` module.
+
+`max_total_bytes` is new in this section: without it, the other limits allow
+1024 queues × 10 000 × 64 KiB ≈ 640 GiB, which does not meet "bounded memory" (§7).
+Confirm or change it in the PR review.
+
+### 14.7 Known limitations and tech debt
+- **Oversized frame closes the connection.** With newline framing the server cannot reliably
+  skip the rest of the frame, so it sends `ERROR FRAME_TOO_LARGE` and closes. A length prefix
+  would allow skipping it; revisit if clients need to survive this.
+- **Shutdown drops messages.** The server stops accepting, closes connections and waits at most
+  `shutdown_timeout`; queued and unacked messages are lost (in-memory only). No draining.
+- **No TLS, authentication or authorization** (§10): anyone who can reach the port can publish
+  and consume. Bind to localhost or a trusted network only.
