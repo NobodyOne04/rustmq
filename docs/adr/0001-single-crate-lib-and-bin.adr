@@ -1,0 +1,38 @@
+# 0001. One crate: a library and the `rustmq` binary
+
+- Status: Accepted
+- Date: 2026-11-11
+
+## Context
+The spec names logical components (server, protocol, broker, queue, consumer, producer,
+config, observability) but says they need not be separate crates (§4). Integration tests
+must drive the server and a client from Rust code (§8). Scope is 1–2 weeks.
+
+## Decision
+One cargo package with `src/lib.rs` and `src/main.rs`:
+- library modules: `config`, `protocol`, `broker` (registry + queue), `server`, `client`,
+  `metrics`
+- `main.rs` is only the clap CLI (`server`, `publish`, `consume`, `status`)
+- Producer and consumer logic live in `client`, shared by the CLI and `tests/`
+- CI on every PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test`
+
+## Alternatives
+- **Cargo workspace** (`rustmq-protocol`, `rustmq-broker`, `rustmq-cli`): the compiler
+  enforces boundaries, but more manifests and setup for the same module graph.
+- **Binary only**: tests in `tests/` can't call into a binary crate, so integration tests
+  would have to spawn processes.
+
+## Rationale
+Rust note: files in `tests/` are separate crates that can only use the library's public
+API. A lib + bin split gives that API for free and keeps one `Cargo.toml`. Module privacy
+(`pub(crate)`) is enough to keep boundaries at this size.
+
+## Consequences
+- One build, one version, simple CI.
+- Boundaries are kept by review, not by the compiler; a module can reach into another's
+  `pub(crate)` items.
+- Splitting into a workspace later is mechanical if it's ever needed.
+
+## References
+SPEC §4, §8, §14.6.
