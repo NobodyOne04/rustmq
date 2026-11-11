@@ -100,6 +100,11 @@ impl Drop for Reservation {
     }
 }
 
+/// Bytes charged against `max_total_bytes` per message on top of its body (ADR 0014), so
+/// empty messages aren't free. An estimate on the high side; a test keeps it above the
+/// real bookkeeping.
+pub const MESSAGE_OVERHEAD: usize = 128;
+
 // Rust note: `Arc<str>` is a shared, immutable string. Cloning it copies a pointer, not the
 // body, so keeping a message in `unacked` and sending it to a consumer costs no copy.
 struct Message {
@@ -396,5 +401,24 @@ impl QueueActor {
         (0..n)
             .map(|i| (self.next_consumer + i) % n)
             .find(|&i| self.consumers[i].unacked < self.config.prefetch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A message lives either in `ready` (as `Message`) or in `unacked` (as `Unacked`),
+    /// plus its body's `Arc` header (two counters). If a struct grows past the constant,
+    /// this fails instead of the byte limit silently undercounting.
+    #[test]
+    fn overhead_covers_the_bookkeeping() {
+        use std::mem::size_of;
+        let home = size_of::<Message>().max(size_of::<Unacked>());
+        let arc_header = 2 * size_of::<usize>();
+        assert!(
+            home + arc_header <= MESSAGE_OVERHEAD,
+            "{home} + {arc_header} > {MESSAGE_OVERHEAD}"
+        );
     }
 }

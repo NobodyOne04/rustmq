@@ -17,3 +17,4 @@ Files are `NNNN-title.adr` (Markdown). Lower numbers are implemented first, one 
 | [0011](0011-client-library.adr) | Client: a typed, single-owner client in the library | Accepted |
 | [0012](0012-cli-and-config.adr) | CLI and config: four subcommands, settings validated in `config` | Accepted |
 | [0013](0013-hello-timeout.adr) | Handshake timeout: a connection must send HELLO within `hello_timeout` | Accepted |
+| [0014](0014-per-message-overhead.adr) | Byte limit: charge each message a fixed overhead | Accepted |
