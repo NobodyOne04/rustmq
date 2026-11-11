@@ -1,0 +1,37 @@
+# 0006. Resource limits: where each one is enforced
+
+- Status: Accepted
+- Date: 2026-11-11
+
+Every configured limit is checked at the one place that already has the information, so
+memory stays bounded without extra round-trips.
+
+## Technical details
+
+**Problem.** Memory must stay bounded and clients must not exhaust the broker (SPEC §7, §10).
+Stage 1 made every limit a setting (§14.4).
+
+**Where each limit lives.**
+
+| Limit (default) | Enforced in | How | On violation |
+|---|---|---|---|
+| `max_connections` (1024) | accept loop | `Semaphore::try_acquire_owned`; the permit moves into the connection task | `ERROR TOO_MANY_CONNECTIONS`, close |
+| `max_queues` (1024) | registry (`src/broker.rs`) | count under the existing std mutex, before spawning | `TOO_MANY_QUEUES` |
+| `max_queue_len` (10 000) | queue actor | `ready.len()` on publish | `QUEUE_FULL` |
+| `max_total_bytes` (256 MiB) | `Broker::publish` | shared `AtomicUsize`, reserve with a compare-and-swap loop before sending to the actor; released on ACK, expiry, or a rejected publish | `QUEUE_FULL` |
+| `max_subscriptions` (16) | connection | count of its subscriptions | `TOO_MANY_SUBSCRIPTIONS` |
+| `max_message_size`, frame, queue name | connection | `read_frame` / `Request::validate` ([0002](0002-wire-protocol-ndjson.adr)) | as in PROTOCOL.md |
+
+- Every channel is bounded.
+- The `(proposed)` note on `max_total_bytes` in SPEC §14.4 is removed in this PR.
+
+**Consequences.**
+- Worst-case memory ≈ `max_total_bytes` + per-message overhead + channel buffers.
+- Queues are never deleted in v1, so `max_queues` slots are used up for the server's
+  lifetime.
+
+## Technologies and alternatives
+- Involved: tokio `Semaphore`, std `Mutex`, `AtomicUsize`.
+- Alternatives:
+  - tokio `Mutex` for the registry: only needed when held across `.await`; it isn't.
+  - Per-queue byte limits only: bounded per queue, not overall.

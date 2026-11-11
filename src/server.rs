@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::broker::{Broker, BrokerError, ConsumerId, Delivery};
 use crate::protocol::{
@@ -20,7 +20,11 @@ use crate::protocol::{
 /// that isn't reading its answers, and on no one else.
 const OUTBOUND_BUFFER: usize = 64;
 
-/// Accepts connections until accepting fails for good.
+/// How long a rejected connection gets to read its ERROR before it is dropped.
+const REJECT_LINGER: Duration = Duration::from_secs(1);
+
+/// Accepts connections until accepting fails for good. At most `max_connections` are
+/// served at once; past that a client gets `TOO_MANY_CONNECTIONS` and is closed.
 ///
 /// `limits.prefetch` must be the `prefetch` the broker was built with: the delivery
 /// channel is sized from it.
@@ -28,16 +32,43 @@ pub async fn serve(
     listener: TcpListener,
     broker: Arc<Broker>,
     limits: Limits,
+    max_connections: usize,
 ) -> std::io::Result<()> {
+    let slots = Arc::new(Semaphore::new(max_connections));
     loop {
         // shortcut: an accept error (e.g. out of file descriptors) stops the server;
-        // ADR 0006 bounds connections and ADR 0008 adds the log to tell why.
+        // ADR 0008 adds the log to tell why.
         let (stream, _peer) = listener.accept().await?;
-        tokio::spawn(connection(stream, broker.clone(), limits.clone()));
+        // Rust note: an owned permit can move into the task; dropping it when the task
+        // ends frees the slot, whichever way the connection ends.
+        match slots.clone().try_acquire_owned() {
+            Ok(permit) => tokio::spawn(connection(stream, broker.clone(), limits.clone(), permit)),
+            Err(_) => tokio::spawn(reject(stream)),
+        };
     }
 }
 
-async fn connection(stream: TcpStream, broker: Arc<Broker>, limits: Limits) {
+/// Sends `TOO_MANY_CONNECTIONS` and closes. The client has likely sent HELLO already;
+/// closing with it unread would reset the connection and could lose the ERROR, so this
+/// shuts down writing first and reads until the client closes (or `REJECT_LINGER`).
+async fn reject(mut stream: TcpStream) {
+    let error = ServerFrame::error(None, ErrorCode::TooManyConnections);
+    let _ = tokio::time::timeout(REJECT_LINGER, async {
+        write_frame(&mut stream, &error).await.ok()?;
+        stream.shutdown().await.ok()?;
+        let mut sink = [0u8; 1024];
+        while stream.read(&mut sink).await.ok()? > 0 {}
+        Some(())
+    })
+    .await;
+}
+
+async fn connection(
+    stream: TcpStream,
+    broker: Arc<Broker>,
+    limits: Limits,
+    _permit: OwnedSemaphorePermit,
+) {
     // Rust note: `into_split` gives two owned halves, so the reader and the writer can live
     // in different tasks without sharing (or locking) the stream.
     let (read, write) = stream.into_split();
@@ -291,5 +322,7 @@ fn broker_code(e: BrokerError) -> ErrorCode {
     match e {
         BrokerError::UnknownDelivery => ErrorCode::UnknownDelivery,
         BrokerError::QueueStopped => ErrorCode::Internal,
+        BrokerError::QueueFull => ErrorCode::QueueFull,
+        BrokerError::TooManyQueues => ErrorCode::TooManyQueues,
     }
 }
