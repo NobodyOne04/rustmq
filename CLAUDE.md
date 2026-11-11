@@ -28,3 +28,5 @@ cargo run -- --help
 - No new dependency without a written reason. `unsafe` is forbidden in `Cargo.toml`.
 - One ADR, one PR: the ADR and its implementation; lower numbers first.
 - Explain non-obvious Rust choices: this is a learning project.
+- Deadlines use `tokio::time::Instant`, never `std::time::Instant`: tests pause tokio's
+  clock (`start_paused`, `advance`) and std's would ignore it (ADR 0005).

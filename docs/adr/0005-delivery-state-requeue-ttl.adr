@@ -1,0 +1,45 @@
+# 0005. Delivery state: ack timeout and TTL in the queue actor
+
+- Status: Accepted
+- Date: 2026-11-11
+
+The queue actor tracks a deadline for every unacked delivery and an expiry for every message,
+and wakes on the earliest deadline itself. No timer tasks, and tests control the clock.
+
+## Technical details
+
+**Problem.** Unacked messages must return to the queue on disconnect or after `ack_timeout`,
+and messages may carry a TTL (SPEC §2.5, §14.1, §14.3). Tests must not rely on sleeps (§8).
+Requeue on disconnect already exists ([0003](0003-queue-actor-per-queue.adr)).
+
+**Ack timeout.**
+- Each `Unacked` entry gets `deadline = now + ack_timeout` when sent.
+- The actor's loop becomes `tokio::select!` over `commands.recv()` and
+  `sleep_until(earliest deadline)`; with nothing unacked it waits on commands only.
+- On a missed deadline the message goes back to the front (same requeue path, ordered by
+  `message_id`, `redelivered`), the consumer's credit is returned, and a later ACK for that
+  tag gets `UNKNOWN_DELIVERY`.
+- `ack_timeout = 0` disables it.
+- Finding the earliest deadline: a `BTreeMap<(Instant, tag), ()>` kept next to `unacked`.
+
+**TTL.**
+- On publish: `expires_at = now + min(ttl_ms or default_ttl_ms, max_ttl_ms)`; no TTL → none.
+- Checked only when a message is about to be handed out; expired ones are dropped and
+  counted (`expired` metric). A message held unacked never expires; after a requeue it is
+  checked again.
+
+**Time.** All instants are `tokio::time::Instant`, so `tokio::time::pause()` /
+`advance()` (tokio's `test-util`, dev only) move the clock in tests.
+
+**Consequences.**
+- One place decides every state change, so ACK vs timeout can't race.
+- An expired message keeps its slot and bytes until it reaches the front.
+- A message that always fails processing is redelivered forever (no dead-letter queue, §11).
+- `std::time::Instant` must not be used for these deadlines, or paused-clock tests break.
+
+## Technologies and alternatives
+- Involved: tokio (`time`: `Instant`, `sleep_until`; `test-util` for tests), std `BTreeMap`.
+- Alternatives:
+  - Timer task per delivery: many tasks and a race between timer and ACK.
+  - Periodic scan: wakes for nothing; test timing depends on the interval.
+  - Expiring messages while queued: needs a timer per message or a scan.
