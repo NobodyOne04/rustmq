@@ -1,0 +1,33 @@
+# 0009. Errors: one enum per module, mapped to protocol codes at the edge
+
+- Status: Accepted
+- Date: 2026-11-11
+
+Each module returns its own typed error; the connection turns them into protocol error codes,
+so clients never see internals.
+
+## Technical details
+
+**Problem.** The spec asks for typed errors and that internal errors never reach remote
+clients (SPEC §5, §10).
+
+**How it works.**
+- One `thiserror` enum per module: `ProtocolError` (exists, [0002](0002-wire-protocol-ndjson.adr)),
+  `BrokerError` (exists, [0003](0003-queue-actor-per-queue.adr)), later `ServerError`,
+  `ClientError`.
+- The connection maps each to an `ErrorCode` (`ProtocolError::code()` already does) and sends
+  `ServerFrame::error`, which uses the code's fixed text. Anything unexpected is `INTERNAL`;
+  details go to the log only.
+- `main` returns `Result<(), Box<dyn std::error::Error>>`.
+- No `unwrap`/`expect` on anything a client controls; `expect` only for broken invariants
+  (e.g. a poisoned lock).
+
+**Consequences.**
+- Some boilerplate per module.
+- The client-facing error set is the protocol's, changed only with the protocol.
+
+## Technologies and alternatives
+- Involved: thiserror 2.
+- Alternatives:
+  - One crate-wide error enum: every module depends on every error.
+  - `anyhow` everywhere: loses the types needed to pick a protocol code.

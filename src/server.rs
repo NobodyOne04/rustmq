@@ -27,6 +27,14 @@ const OUTBOUND_BUFFER: usize = 64;
 /// How long a rejected connection gets to read its ERROR before it is dropped.
 const REJECT_LINGER: Duration = Duration::from_secs(1);
 
+/// Why `run` stopped on its own (ADR 0009). Client-caused problems never end up here: they
+/// are answered with an `ErrorCode` and, at worst, close that one connection.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("accepting connections failed: {0}")]
+    Accept(#[source] std::io::Error),
+}
+
 /// The server's own settings; queue settings live in the broker's `BrokerConfig`.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -50,7 +58,7 @@ pub async fn run(
     broker: Arc<Broker>,
     config: ServerConfig,
     shutdown: impl Future<Output = ()>,
-) -> std::io::Result<()> {
+) -> Result<(), ServerError> {
     let slots = Arc::new(Semaphore::new(config.max_connections));
     // Rust note: a `watch` channel holds one value every receiver can read, and wakes them
     // when it changes: a broadcast "stop" that late joiners still see.
@@ -68,7 +76,7 @@ pub async fn run(
                     Ok(a) => a,
                     Err(e) => {
                         tracing::error!(error = %e, "accept failed, shutting down");
-                        break Err(e);
+                        break Err(ServerError::Accept(e));
                     }
                 };
                 // Rust note: an owned permit can move into the task; dropping it when the
@@ -448,6 +456,7 @@ impl Connection {
     }
 }
 
+/// The client's view of a broker error: a protocol code with fixed text (ADR 0009).
 fn broker_code(e: BrokerError) -> ErrorCode {
     match e {
         BrokerError::UnknownDelivery => ErrorCode::UnknownDelivery,
@@ -458,5 +467,32 @@ fn broker_code(e: BrokerError) -> ErrorCode {
         }
         BrokerError::QueueFull => ErrorCode::QueueFull,
         BrokerError::TooManyQueues => ErrorCode::TooManyQueues,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every broker error has a code, and the frame sent carries only that code's fixed
+    /// text, never the error's own (which may name internals).
+    #[test]
+    fn broker_errors_reach_clients_as_fixed_codes() {
+        for (e, code) in [
+            (BrokerError::UnknownDelivery, ErrorCode::UnknownDelivery),
+            (BrokerError::QueueStopped, ErrorCode::Internal),
+            (BrokerError::QueueFull, ErrorCode::QueueFull),
+            (BrokerError::TooManyQueues, ErrorCode::TooManyQueues),
+        ] {
+            let internal = e.to_string();
+            assert_eq!(broker_code(e), code);
+            let ServerFrame::Error { message, .. } = ServerFrame::error(Some(1), code) else {
+                unreachable!()
+            };
+            assert_eq!(message, code.message());
+            if code == ErrorCode::Internal {
+                assert_ne!(message, internal, "internal text must not leak");
+            }
+        }
     }
 }

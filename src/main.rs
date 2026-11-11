@@ -5,6 +5,9 @@ use clap::Parser;
 #[command(version, about)]
 struct Cli {}
 
-fn main() {
+// Rust note: returning `Result` from `main` prints the error and exits with a failure code,
+// so any module's typed error can surface here with `?` (ADR 0009).
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     Cli::parse();
+    Ok(())
 }
