@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::metrics::Metrics;
 use queue::{Command, QueueActor, Reservation};
-pub use queue::{Delivery, QueueStats};
+pub use queue::{Delivery, MESSAGE_OVERHEAD, QueueStats};
 
 /// Commands waiting per queue before senders have to wait (back-pressure on producers).
 const COMMAND_BUFFER: usize = 1024;
@@ -34,7 +34,8 @@ pub struct BrokerConfig {
     pub max_queues: usize,
     /// Ready (not handed out) messages per queue.
     pub max_queue_len: usize,
-    /// Body bytes of all messages held, ready or unacked, across all queues.
+    /// Bytes of all messages held, ready or unacked, across all queues: each body plus
+    /// `MESSAGE_OVERHEAD` (ADR 0014).
     pub max_total_bytes: usize,
 }
 
@@ -113,7 +114,11 @@ impl Broker {
         body: Arc<str>,
         ttl: Option<Duration>,
     ) -> Result<u64, BrokerError> {
-        let bytes = Reservation::take(&self.held_bytes, body.len(), self.config.max_total_bytes)
+        // An empty body still costs its bookkeeping (ADR 0014).
+        let bytes = body
+            .len()
+            .checked_add(MESSAGE_OVERHEAD)
+            .and_then(|size| Reservation::take(&self.held_bytes, size, self.config.max_total_bytes))
             .ok_or(BrokerError::QueueFull)?;
         let (reply, rx) = oneshot::channel();
         self.send(
@@ -652,7 +657,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn total_bytes_are_released_by_ack_expiry_and_rejection() {
-        let b = limited(10, 1, 10);
+        // Room for 10 body bytes in at most 3 messages.
+        const O: usize = MESSAGE_OVERHEAD;
+        let b = limited(10, 1, 10 + 3 * O);
         b.publish("a", body("12345"), None).await.unwrap();
         b.publish("b", body("12345"), Some(Duration::from_secs(1)))
             .await
@@ -660,7 +667,7 @@ mod tests {
         assert_eq!(
             b.publish("c", body("1"), None).await,
             Err(BrokerError::QueueFull),
-            "10 of 10 bytes held"
+            "10 body bytes in 2 messages: 1 more byte needs a 3rd overhead and an 11th byte"
         );
 
         // ACK releases
@@ -695,10 +702,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_bodies_are_charged_the_overhead() {
+        let b = limited(10, 100, 2 * MESSAGE_OVERHEAD);
+        b.publish("q", body(""), None).await.unwrap();
+        b.publish("q", body(""), None).await.unwrap();
+        assert_eq!(
+            b.publish("q", body(""), None).await,
+            Err(BrokerError::QueueFull)
+        );
+        let b = limited(10, 100, MESSAGE_OVERHEAD - 1);
+        assert_eq!(
+            b.publish("q", body(""), None).await,
+            Err(BrokerError::QueueFull)
+        );
+    }
+
     /// Many publishers race for the last bytes: exactly as many succeed as fit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn byte_limit_holds_under_concurrency() {
-        let b = Arc::new(limited(100, 10_000, 1000));
+        let b = Arc::new(limited(100, 10_000, 100 * (10 + MESSAGE_OVERHEAD)));
         let tasks: Vec<_> = (0..50)
             .map(|i| {
                 let b = b.clone();
@@ -718,7 +741,7 @@ mod tests {
         for t in tasks {
             accepted += t.await.unwrap();
         }
-        assert_eq!(accepted, 100, "1000 bytes / 10 per message");
+        assert_eq!(accepted, 100, "room for 100 messages of 10 bytes each");
     }
 
     /// Many producers and competing consumers on one queue: every message is delivered

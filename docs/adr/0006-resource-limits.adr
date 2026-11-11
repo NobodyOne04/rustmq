@@ -26,7 +26,8 @@ Stage 1 made every limit a setting (§14.4).
 - The `(proposed)` note on `max_total_bytes` in SPEC §14.4 is removed in this PR.
 
 **Consequences.**
-- Worst-case memory ≈ `max_total_bytes` + per-message overhead + channel buffers.
+- Worst-case memory ≈ `max_total_bytes` + per-message overhead + channel buffers. (Revised by
+  [0014](0014-per-message-overhead.adr): the overhead now counts toward `max_total_bytes`.)
 - Queues are never deleted in v1, so `max_queues` slots are used up for the server's
   lifetime.
 

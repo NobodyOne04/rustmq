@@ -423,7 +423,7 @@ Every limit is a setting (CLI flag on `rustmq server`), with these defaults:
 | `max_message_size` | 64 KiB | at most 16 MiB |
 | `max_queues` | 1024 | queues are never deleted in v1 |
 | `max_queue_len` | 10 000 | ready messages per queue; full → `QUEUE_FULL` |
-| `max_total_bytes` | 256 MiB | all held bodies, ready and unacked; full → `QUEUE_FULL` (see 14.6) |
+| `max_total_bytes` | 256 MiB | all held messages, ready and unacked: body + 128 bytes each (ADR 0014); full → `QUEUE_FULL` (see 14.6) |
 | `max_queue_name_len` | 255 | names match `[A-Za-z0-9._-]+` |
 | `max_subscriptions` | 16 | per connection |
 | `prefetch` | 1 | unacked deliveries per subscription |
