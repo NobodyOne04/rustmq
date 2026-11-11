@@ -73,13 +73,19 @@ pub(super) struct Reservation {
 impl Reservation {
     /// Takes `size` bytes if the total stays within `max`.
     pub(super) fn take(held: &Arc<AtomicUsize>, size: usize, max: usize) -> Option<Self> {
-        // Rust note: `fetch_update` is a compare-and-swap loop: it retries if another
-        // publish changed the total in between, so two can't both take the last bytes.
-        // Relaxed: the counter guards no other memory.
-        held.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
-            h.checked_add(size).filter(|&total| total <= max)
-        })
-        .ok()?;
+        // Rust note: a compare-and-swap loop. `compare_exchange_weak` stores the new total
+        // only if the counter still holds `current`; if another publish changed it in
+        // between, retry with the fresh value, so two can't both take the last bytes.
+        // (`fetch_update` does the same but is deprecated on newer Rust.) Relaxed: the
+        // counter guards no other memory.
+        let mut current = held.load(Ordering::Relaxed);
+        loop {
+            let total = current.checked_add(size).filter(|&total| total <= max)?;
+            match held.compare_exchange_weak(current, total, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         Some(Self {
             size,
             held: held.clone(),
