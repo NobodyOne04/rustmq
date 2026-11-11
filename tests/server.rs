@@ -1,4 +1,5 @@
-//! The server over real TCP (ADR 0004): handshake, publish/subscribe/ack, disconnects, and
+//! The server over real TCP (ADR 0004): handshake, publish/subscribe/ack, disconnects, limits
+//! (ADR 0006), shutdown (ADR 0007), and
 //! a client that stops reading. Tests wait on replies, never on sleeps; the timeout in
 //! `recv` only turns a hang into a failure.
 
@@ -8,11 +9,13 @@ use std::time::Duration;
 
 use rustmq::broker::{Broker, BrokerConfig};
 use rustmq::protocol::{Limits, read_frame};
-use rustmq::server::serve;
+use rustmq::server::{ServerConfig, run};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 fn limits(prefetch: usize, max_subscriptions: usize) -> Limits {
     Limits {
@@ -35,14 +38,52 @@ async fn start_with(
     config: BrokerConfig,
     max_connections: usize,
 ) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let broker = Arc::new(Broker::with_config(BrokerConfig {
-        prefetch: limits.prefetch,
-        ..config
-    }));
-    tokio::spawn(serve(listener, broker, limits, max_connections));
-    addr
+    let server = Server::start(limits, config, max_connections, Duration::from_secs(5)).await;
+    // Never stopped: the test's runtime ends it. Forgetting the sender keeps `stop` pending.
+    std::mem::forget(server.stop);
+    server.addr
+}
+
+/// A running server that a test can shut down.
+struct Server {
+    addr: std::net::SocketAddr,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<std::io::Result<()>>,
+}
+
+impl Server {
+    async fn start(
+        limits: Limits,
+        config: BrokerConfig,
+        max_connections: usize,
+        shutdown_timeout: Duration,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let broker = Arc::new(Broker::with_config(BrokerConfig {
+            prefetch: limits.prefetch,
+            ..config
+        }));
+        let config = ServerConfig {
+            limits,
+            max_connections,
+            shutdown_timeout,
+        };
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(run(listener, broker, config, async {
+            let _ = stopped.await;
+        }));
+        Server { addr, stop, task }
+    }
+
+    /// Signals shutdown and waits for `run` to return.
+    async fn shut_down(self) -> std::io::Result<()> {
+        self.stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), self.task)
+            .await
+            .expect("run didn't return")
+            .unwrap()
+    }
 }
 
 struct Client {
@@ -446,4 +487,81 @@ async fn broker_limits_reach_the_client() {
     // still open, and the failed SUBSCRIBE used no subscription slot
     c.subscribe("q").await;
     assert_eq!(c.message().await["body"], "a");
+}
+
+#[tokio::test]
+async fn shutdown_closes_active_connections() {
+    let server = Server::start(
+        limits(1, 16),
+        BrokerConfig::default(),
+        1024,
+        Duration::from_secs(5),
+    )
+    .await;
+    let addr = server.addr;
+    let mut producer = Client::hello(addr).await;
+    let mut consumer = Client::hello(addr).await;
+    consumer.subscribe("q").await;
+    let id = producer.publish("q", "unacked").await;
+    assert_eq!(consumer.message().await["message_id"], id);
+    let mut before_hello = Client::connect(addr).await;
+    let mut mid_frame = Client::hello(addr).await;
+    mid_frame.write.write_all(b"{\"type\":\"STA").await.unwrap();
+
+    server.shut_down().await.unwrap();
+
+    for c in [
+        &mut producer,
+        &mut consumer,
+        &mut before_hello,
+        &mut mid_frame,
+    ] {
+        assert!(c.recv().await.is_none(), "closed by the server");
+    }
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "no longer accepting"
+    );
+}
+
+/// A connection stuck writing to a client that doesn't read can't hold shutdown past
+/// `shutdown_timeout`. (That its writer task is aborted too, not left blocked on the
+/// socket, isn't visible here: draining the socket would unblock it either way.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_timeout_aborts_stuck_connections() {
+    const PREFETCH: usize = 300;
+    let server = Server::start(
+        limits(PREFETCH, 1),
+        BrokerConfig::default(),
+        1024,
+        Duration::from_millis(200),
+    )
+    .await;
+    let mut stalled = Client::hello(server.addr).await;
+    stalled.subscribe("big").await;
+    let mut producer = Client::hello(server.addr).await;
+    let body = "x".repeat(32 * 1024);
+    for _ in 0..PREFETCH {
+        producer.publish("big", &body).await;
+    }
+    // `stalled` has read nothing: its server-side writer is blocked on a full socket.
+    // Queue one more answer so the reader is stuck too, behind the full outbound channel.
+    for _ in 0..100 {
+        stalled.send(json!({"type": "STATS"})).await;
+    }
+
+    let started = std::time::Instant::now();
+    server.shut_down().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // The connection ends: reading drains what was sent, then the socket closes.
+    let mut frames = 0;
+    while stalled.recv().await.is_some() {
+        frames += 1;
+    }
+    assert!(frames <= PREFETCH + 100 + 1, "{frames}");
 }

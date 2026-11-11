@@ -1,14 +1,17 @@
 //! The TCP server: accepts connections and runs each one as a reader task and a writer
 //! task joined by a bounded channel, so a slow client only slows itself (ADR 0004).
+//! Shutdown is one `watch` signal plus a bounded wait for connections (ADR 0007).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::broker::{Broker, BrokerError, ConsumerId, Delivery};
 use crate::protocol::{
@@ -23,29 +26,80 @@ const OUTBOUND_BUFFER: usize = 64;
 /// How long a rejected connection gets to read its ERROR before it is dropped.
 const REJECT_LINGER: Duration = Duration::from_secs(1);
 
-/// Accepts connections until accepting fails for good. At most `max_connections` are
-/// served at once; past that a client gets `TOO_MANY_CONNECTIONS` and is closed.
+/// The server's own settings; queue settings live in the broker's `BrokerConfig`.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Sent in the HELLO answer and enforced per connection. `limits.prefetch` must be the
+    /// broker's `prefetch`: the delivery channel is sized from it.
+    pub limits: Limits,
+    /// Connections served at once; past that a client gets `TOO_MANY_CONNECTIONS`.
+    pub max_connections: usize,
+    /// After the shutdown signal, how long connections get to finish before they are
+    /// aborted.
+    pub shutdown_timeout: Duration,
+}
+
+/// Serves connections until `shutdown` completes (or accepting fails), then stops accepting,
+/// tells every connection to close and waits at most `shutdown_timeout` for them.
 ///
-/// `limits.prefetch` must be the `prefetch` the broker was built with: the delivery
-/// channel is sized from it.
-pub async fn serve(
+/// `main` passes Ctrl-C as `shutdown`; tests pass their own future. Queued and unacked
+/// messages are lost (SPEC §14.7): the queues end when the last `Arc<Broker>` is dropped.
+pub async fn run(
     listener: TcpListener,
     broker: Arc<Broker>,
-    limits: Limits,
-    max_connections: usize,
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
-    let slots = Arc::new(Semaphore::new(max_connections));
-    loop {
-        // shortcut: an accept error (e.g. out of file descriptors) stops the server;
-        // ADR 0008 adds the log to tell why.
-        let (stream, _peer) = listener.accept().await?;
-        // Rust note: an owned permit can move into the task; dropping it when the task
-        // ends frees the slot, whichever way the connection ends.
-        match slots.clone().try_acquire_owned() {
-            Ok(permit) => tokio::spawn(connection(stream, broker.clone(), limits.clone(), permit)),
-            Err(_) => tokio::spawn(reject(stream)),
-        };
+    let slots = Arc::new(Semaphore::new(config.max_connections));
+    // Rust note: a `watch` channel holds one value every receiver can read, and wakes them
+    // when it changes: a broadcast "stop" that late joiners still see.
+    let (stop_tx, stop) = watch::channel(false);
+    let mut connections = JoinSet::new();
+    // Rust note: `select!` polls `shutdown` by reference on every turn of the loop, so it
+    // must stay at one place in memory: `pin!` fixes it on the stack.
+    tokio::pin!(shutdown);
+    let result = loop {
+        tokio::select! {
+            () = &mut shutdown => break Ok(()),
+            accepted = listener.accept() => {
+                // shortcut: an accept error (e.g. out of file descriptors) stops the
+                // server; ADR 0008 adds the log to tell why.
+                let (stream, _peer) = match accepted {
+                    Ok(a) => a,
+                    Err(e) => break Err(e),
+                };
+                // Rust note: an owned permit can move into the task; dropping it when the
+                // task ends frees the slot, whichever way the connection ends.
+                match slots.clone().try_acquire_owned() {
+                    Ok(permit) => connections.spawn(connection(
+                        stream,
+                        broker.clone(),
+                        config.limits.clone(),
+                        permit,
+                        stop.clone(),
+                    )),
+                    Err(_) => connections.spawn(reject(stream)),
+                };
+            }
+            // Finished tasks stay in a JoinSet until joined: reap them as they end.
+            Some(_) = connections.join_next() => {}
+        }
+    };
+
+    // shortcut: ADR 0007 also logs shutdown start, connections left and a hit timeout;
+    // that needs `tracing` (ADR 0008).
+    drop(listener); // refuse new connections right away
+    let _ = stop_tx.send(true);
+    let drained = tokio::time::timeout(config.shutdown_timeout, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        // A connection stuck on a client (e.g. a write to one that doesn't read).
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
+    result
 }
 
 /// Sends `TOO_MANY_CONNECTIONS` and closes. The client has likely sent HELLO already;
@@ -68,12 +122,15 @@ async fn connection(
     broker: Arc<Broker>,
     limits: Limits,
     _permit: OwnedSemaphorePermit,
+    stop: watch::Receiver<bool>,
 ) {
     // Rust note: `into_split` gives two owned halves, so the reader and the writer can live
     // in different tasks without sharing (or locking) the stream.
     let (read, write) = stream.into_split();
     let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_BUFFER);
-    let writer = tokio::spawn(write_loop(write, outbound_rx));
+    // Aborting this task (shutdown timeout) must not leave the writer behind, stuck on a
+    // client that doesn't read: the guard aborts it when this function ends, however it ends.
+    let mut writer = AbortOnDrop(tokio::spawn(write_loop(write, outbound_rx)));
 
     let consumer = broker.new_consumer_id();
     // Every queue's credit (`prefetch`) bounds what it can have in this channel, so it never
@@ -90,14 +147,23 @@ async fn connection(
         in_flight: HashMap::new(),
         next_delivery_id: 0,
     };
-    conn.read_loop(BufReader::new(read), deliveries).await;
+    conn.read_loop(BufReader::new(read), deliveries, stop).await;
 
     for queue in &conn.subscriptions {
         conn.broker.consumer_gone(queue, consumer).await;
     }
     // Dropping the last sender lets the writer send what is queued, then finish and close.
     drop(conn);
-    let _ = writer.await;
+    let _ = (&mut writer.0).await;
+}
+
+/// Aborts the task when dropped (a plain `JoinHandle` lets it run on).
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Writes frames until the channel closes or the client is gone.
@@ -134,6 +200,7 @@ impl Connection {
         &mut self,
         mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         mut deliveries: mpsc::Receiver<Delivery>,
+        mut stop: watch::Receiver<bool>,
     ) {
         let mut buf = Vec::new();
         let mut hello_done = false;
@@ -155,6 +222,11 @@ impl Connection {
                     }
                 }
                 Some(d) = deliveries.recv() => self.on_delivery(d).await,
+                // Shutdown: leave through the normal end-of-connection path. `wait_for`
+                // also sees a stop sent before this connection started waiting.
+                // Rust note: it returns a guard holding a lock; the `async` block drops it
+                // at once, or it would sit in `select!`'s output and make this future !Send.
+                () = async { let _ = stop.wait_for(|&stopped| stopped).await; } => Next::Close,
             };
             if let Next::Close = next {
                 return;
