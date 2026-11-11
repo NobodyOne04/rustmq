@@ -1,0 +1,62 @@
+# 0011. Client: a typed, single-owner client in the library
+
+- Status: Accepted
+- Date: 2026-11-11
+
+A `client` module speaks the protocol with the crate's own types, one request at a time, and
+holds MESSAGEs that arrive while it waits for an answer. The CLI ([0012](0012-cli-and-config.adr))
+and tests use it.
+
+## Technical details
+
+**Problem.** The `publish`, `consume` and `status` commands (SPEC §6, §14.5) need a client,
+and SPEC §14.6 lists a `client` module. Today only a test-only, JSON-`Value` client exists
+in `tests/server.rs`.
+
+**API** (`src/client.rs`):
+- `Client::connect(addr) -> Result<Client, ClientError>`: TCP connect, then HELLO with
+  `protocol::VERSIONS`; keeps the server's `Limits` (`client.limits()`).
+- `publish(&mut self, queue, body, ttl: Option<Duration>) -> Result<u64, _>`: the message id.
+- `subscribe(&mut self, queue) -> Result<(), _>`.
+- `next_message(&mut self) -> Result<Message, _>`: `Message { queue, message_id,
+  delivery_id, body, redelivered }`; waits for the next MESSAGE.
+- `ack(&mut self, delivery_id) -> Result<(), _>`.
+- `stats(&mut self) -> Result<protocol::Stats, _>`.
+
+**How it works.**
+- Owns `BufReader<OwnedReadHalf>` and `OwnedWriteHalf`; methods take `&mut self`, so one
+  request is in flight at a time and answers need no lookup table: the next RESPONSE/ERROR
+  carries the `request_id` just sent (checked; a mismatch is `ClientError::Unexpected`).
+- MESSAGEs read while waiting for an answer go into a `VecDeque`, which `next_message`
+  drains first. Its size is bounded by the server's credit (`prefetch` per subscription):
+  the server sends no more until the client ACKs.
+- Frames are read with `protocol::read_frame` and decoded into `ServerFrame`; no
+  `serde_json::Value`. Limit: the server's `max_frame_size` plus `ENVELOPE_OVERHEAD`, since a
+  MESSAGE has more fields than the PUBLISH that carried its body and can be a little longer
+  than the largest PUBLISH the server accepts.
+- No timeouts inside: callers wrap calls in `tokio::time::timeout` if they need one.
+
+**Errors** ([0009](0009-typed-errors.adr)): `ClientError` with `Io`, `Protocol(ProtocolError)`,
+`Server { code: ErrorCode, message }` (an ERROR frame), `Unexpected` (a frame that doesn't fit),
+`Closed` (EOF).
+
+**Tests.** `tests/client.rs` runs it against an in-process server
+([0010](0010-test-strategy.adr)): each method, server errors as `ClientError::Server`,
+MESSAGEs interleaved with answers. `tests/server.rs` keeps its raw JSON client: it tests
+the wire format itself (malformed frames, exact JSON), which a typed client can't send.
+This differs from ADR 0010's "talk to it through `client`" for those tests.
+
+**Consequences.**
+- Simple to read and to use from a CLI; no background task to shut down.
+- No pipelining: a producer waits for each answer before the next PUBLISH (one round trip
+  per message). Fine for the CLI and tests; a load generator would want more.
+- Not usable from several tasks at once (`&mut self`); share by giving each task its own
+  connection.
+
+## Technologies and alternatives
+- Involved: tokio (`net`, `io-util`), the crate's `protocol` module.
+- Alternatives:
+  - Background reader task with a `request_id → oneshot` map, `&self` methods: pipelining and
+    sharing across tasks, but a task to manage and more code than the CLI needs.
+  - Keep using `serde_json::Value` like the test client: no types, every caller re-checks
+    field names.
