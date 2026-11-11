@@ -243,27 +243,29 @@ pub fn validate_queue_name(name: &str, max_len: usize) -> Result<(), ErrorCode> 
 ///
 /// At most `max_frame + 1` bytes are buffered, so an oversized frame is caught without
 /// reading it whole. After `FrameTooLarge` the stream is mid-frame: close the connection.
+///
+/// Cancel-safe: bytes of an unfinished frame stay in `buf`, so the call can lose a
+/// `select!` race and be repeated with the same `buf` without losing data (ADR 0004).
 pub async fn read_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
+    buf: &mut Vec<u8>,
     max_frame: usize,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
-    let mut buf = Vec::new();
     // Rust note: `take` consumes its receiver, so it gets `&mut *reader` (a fresh borrow)
     // instead of `reader` itself; the reader is usable again once this call returns.
-    let limit = max_frame as u64 + 1;
-    let n = (&mut *reader)
-        .take(limit)
-        .read_until(b'\n', &mut buf)
-        .await?;
-    if n == 0 {
-        return Ok(None);
-    }
+    // The limit counts what an earlier, cancelled call already put in `buf`.
+    let limit = (max_frame as u64 + 1).saturating_sub(buf.len() as u64);
+    (&mut *reader).take(limit).read_until(b'\n', buf).await?;
     if buf.last() == Some(&b'\n') {
         buf.pop();
-        return Ok(Some(buf));
+        // Rust note: `mem::take` moves the frame out and leaves `buf` empty for the next one.
+        return Ok(Some(std::mem::take(buf)));
     }
     if buf.len() > max_frame {
         return Err(ProtocolError::FrameTooLarge(max_frame));
+    }
+    if buf.is_empty() {
+        return Ok(None);
     }
     // Stream ended in the middle of a frame.
     Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
@@ -448,24 +450,47 @@ mod tests {
     async fn reads_frames_until_eof() {
         let mut r = BufReader::new(&b"{\"a\":1}\n\n{\"b\":2}\n"[..]);
         assert_eq!(
-            read_frame(&mut r, 100).await.unwrap().unwrap(),
+            read_frame(&mut r, &mut Vec::new(), 100)
+                .await
+                .unwrap()
+                .unwrap(),
             b"{\"a\":1}"
         );
-        assert_eq!(read_frame(&mut r, 100).await.unwrap().unwrap(), b"");
         assert_eq!(
-            read_frame(&mut r, 100).await.unwrap().unwrap(),
+            read_frame(&mut r, &mut Vec::new(), 100)
+                .await
+                .unwrap()
+                .unwrap(),
+            b""
+        );
+        assert_eq!(
+            read_frame(&mut r, &mut Vec::new(), 100)
+                .await
+                .unwrap()
+                .unwrap(),
             b"{\"b\":2}"
         );
-        assert!(read_frame(&mut r, 100).await.unwrap().is_none());
+        assert!(
+            read_frame(&mut r, &mut Vec::new(), 100)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn frame_limit_is_exact() {
         let mut r = BufReader::new(&b"12345\n"[..]);
-        assert_eq!(read_frame(&mut r, 5).await.unwrap().unwrap(), b"12345");
+        assert_eq!(
+            read_frame(&mut r, &mut Vec::new(), 5)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"12345"
+        );
         let mut r = BufReader::new(&b"123456\n"[..]);
         assert!(matches!(
-            read_frame(&mut r, 5).await,
+            read_frame(&mut r, &mut Vec::new(), 5).await,
             Err(ProtocolError::FrameTooLarge(5))
         ));
     }
@@ -477,7 +502,7 @@ mod tests {
         // BufReader happens to hold.
         let mut r = BufReader::with_capacity(16, &big[..]);
         assert!(matches!(
-            read_frame(&mut r, 64).await,
+            read_frame(&mut r, &mut Vec::new(), 64).await,
             Err(ProtocolError::FrameTooLarge(64))
         ));
     }
@@ -485,10 +510,44 @@ mod tests {
     #[tokio::test]
     async fn eof_mid_frame_is_an_error() {
         let mut r = BufReader::new(&b"{\"a\""[..]);
-        let err = read_frame(&mut r, 100).await.unwrap_err();
+        let err = read_frame(&mut r, &mut Vec::new(), 100).await.unwrap_err();
         assert!(
             matches!(err, ProtocolError::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
         );
+    }
+
+    /// A read cancelled mid-frame (as when it loses a `select!`) keeps the bytes it read.
+    #[tokio::test]
+    async fn cancelled_read_keeps_partial_frame() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let mut r = BufReader::new(server);
+        let mut buf = Vec::new();
+        client.write_all(b"{\"a\":").await.unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            read_frame(&mut r, &mut buf, 10),
+        )
+        .await;
+        assert!(first.is_err(), "no full frame yet");
+        assert_eq!(buf, b"{\"a\":");
+        client.write_all(b"1}\n").await.unwrap();
+        assert_eq!(
+            read_frame(&mut r, &mut buf, 10).await.unwrap().unwrap(),
+            b"{\"a\":1}"
+        );
+        assert!(buf.is_empty());
+        // the limit counts the bytes kept from the cancelled call
+        client.write_all(b"123456").await.unwrap();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            read_frame(&mut r, &mut buf, 10),
+        )
+        .await;
+        client.write_all(b"78901\n").await.unwrap();
+        assert!(matches!(
+            read_frame(&mut r, &mut buf, 10).await,
+            Err(ProtocolError::FrameTooLarge(10))
+        ));
     }
 
     #[tokio::test]
@@ -507,7 +566,10 @@ mod tests {
             "body newline must be escaped"
         );
         let mut r = BufReader::new(&out[..]);
-        let line = read_frame(&mut r, 1000).await.unwrap().unwrap();
+        let line = read_frame(&mut r, &mut Vec::new(), 1000)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(decode::<Request>(&line).unwrap(), frame);
     }
 }

@@ -1,0 +1,53 @@
+# 0004. Connections: separate reader and writer; queues never wait on a socket
+
+- Status: Accepted
+- Date: 2026-11-11
+
+Each connection gets a reader task and a writer task joined by a bounded channel, and queues
+push to it without waiting. A slow or stalled client then only slows itself.
+
+## Technical details
+
+**Problem.** A consumer's socket can be slow or stalled. If a queue waited on it, every
+consumer and producer of that queue would stall (SPEC §2.6). Responses and pushed MESSAGEs
+share one socket. [0003](0003-queue-actor-per-queue.adr) already requires that the queue
+actor never `.await` on a client.
+
+**Tasks per connection** (`src/server.rs`).
+- `TcpStream::into_split()` gives owned read and write halves.
+- **Reader:** `read_frame` → `decode::<Request>` → `validate` → calls `Broker` → pushes
+  the RESPONSE/ERROR into the outbound channel with `send().await` (back-pressure falls on
+  this client only).
+- **Writer:** owns the write half; drains the outbound channel with `write_frame`.
+- Deliveries from queues arrive on one `mpsc::Receiver<Delivery>` per connection; the reader's
+  `select!` turns each into a `MESSAGE` frame for the outbound channel.
+
+**Credit and channel size.**
+- A queue sends a consumer a message only while its unacked count is below `prefetch`
+  (implemented in [0003](0003-queue-actor-per-queue.adr)).
+- The delivery channel holds `max_subscriptions × prefetch` items, so credit alone keeps it
+  from filling. If `try_send` still fails, the consumer is treated as gone and its messages
+  requeued (already the queue's behaviour).
+
+**IDs.** The connection assigns `delivery_id`s (counter from 1) and keeps
+`HashMap<delivery_id, (queue, tag)>` to route an ACK to the right queue. Unknown id:
+`ERROR UNKNOWN_DELIVERY` without asking any queue.
+
+**End of connection.** EOF, read error, protocol error that closes, or shutdown: the reader
+calls `Broker::consumer_gone` for each subscribed queue, then drops the outbound sender so the
+writer finishes and closes the socket.
+
+**Consequences.**
+- Back-pressure stays with the client that causes it.
+- A client that stops reading fills its own channel and is disconnected, not waited for.
+- The channel sizes and credit math are where concurrency bugs would hide; this PR gets the
+  heaviest tests (stalled reader, disconnect mid-delivery, ACK after requeue).
+
+## Technologies and alternatives
+- Involved: tokio (`net`: `TcpListener`, `TcpStream::into_split`; `sync::mpsc`; `select!`).
+- Alternatives:
+  - Queue writes to the socket directly: one slow client blocks the whole queue.
+  - Unbounded outbound channel with `send().await`: never blocks, but memory grows without
+    limit for a stalled client (SPEC §7, §10).
+  - One task per connection doing both directions: a slow write blocks reading ACKs, which
+    is what frees credit.
