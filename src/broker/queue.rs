@@ -150,7 +150,9 @@ impl QueueActor {
                     id,
                     body,
                     redelivered: false,
-                    expires_at: ttl.map(|ttl| Instant::now() + ttl),
+                    // `checked_add`: `+` panics past the clock's range, and `ttl_ms` comes
+                    // from the client (u64::MAX ms would kill this task). Too far = never.
+                    expires_at: ttl.and_then(|ttl| Instant::now().checked_add(ttl)),
                 });
                 // The producer may have gone; the message stays queued either way.
                 let _ = reply.send(id);
@@ -284,9 +286,10 @@ impl QueueActor {
             // a closed one that it is gone; either way it's dropped and its messages requeued.
             if consumer.tx.try_send(delivery).is_ok() {
                 consumer.unacked += 1;
-                // A zero ack timeout turns it off.
-                let deadline = (!self.config.ack_timeout.is_zero())
-                    .then(|| Instant::now() + self.config.ack_timeout);
+                // A zero ack timeout turns it off; one too large to add is as good as off.
+                let deadline = Instant::now()
+                    .checked_add(self.config.ack_timeout)
+                    .filter(|_| !self.config.ack_timeout.is_zero());
                 if let Some(at) = deadline {
                     self.deadlines.insert((at, tag));
                 }

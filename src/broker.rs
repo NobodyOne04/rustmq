@@ -510,6 +510,30 @@ mod tests {
         assert_eq!(rx2.try_recv(), Err(TryRecvError::Empty));
     }
 
+    /// Durations past the clock's range come from clients (`ttl_ms`) and flags; they must
+    /// mean "never", not panic the queue's task.
+    #[tokio::test(start_paused = true)]
+    async fn huge_durations_mean_never() {
+        let b = Broker::with_config(BrokerConfig {
+            prefetch: 1,
+            ack_timeout: Duration::MAX,
+            default_ttl: None,
+            max_ttl: None,
+        });
+        b.publish("q", body("a"), Some(Duration::from_millis(u64::MAX)))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(365 * 24 * 3600)).await;
+        let (_, mut rx) = subscriber(&b, "q", 1).await;
+        assert_eq!(&*rx.recv().await.unwrap().body, "a");
+        tokio::time::advance(Duration::from_secs(365 * 24 * 3600)).await;
+        assert_eq!(
+            settle(&b, "q").await,
+            stats(0, 1, 0),
+            "the queue task is alive"
+        );
+    }
+
     /// Many producers and competing consumers on one queue: every message is delivered
     /// exactly once (nobody disconnects) and no message is held by two consumers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
