@@ -13,3 +13,4 @@ Files are `NNNN-title.adr` (Markdown). Lower numbers are implemented first, one 
 | [0007](0007-graceful-shutdown.adr) | Graceful shutdown: a watch channel, a JoinSet and a timeout | Accepted |
 | [0008](0008-observability.adr) | Observability: tracing logs and atomic counters read via STATS | Accepted |
 | [0009](0009-typed-errors.adr) | Errors: one enum per module, mapped to protocol codes at the edge | Accepted |
+| [0010](0010-test-strategy.adr) | Tests: in-process server, reply-driven sync, paused clock | Accepted |
