@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use super::{BrokerConfig, BrokerError, ConsumerId};
+use crate::metrics::Metrics;
 
 /// A message handed to a consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +129,7 @@ pub(super) struct QueueActor {
     name: Arc<str>,
     config: BrokerConfig,
     message_ids: Arc<AtomicU64>,
+    metrics: Arc<Metrics>,
     ready: VecDeque<Message>,
     unacked: HashMap<u64, Unacked>,
     /// The `unacked` deadlines in time order, so the earliest is `first()`. The tag makes
@@ -141,11 +143,17 @@ pub(super) struct QueueActor {
 }
 
 impl QueueActor {
-    pub(super) fn new(name: Arc<str>, config: BrokerConfig, message_ids: Arc<AtomicU64>) -> Self {
+    pub(super) fn new(
+        name: Arc<str>,
+        config: BrokerConfig,
+        message_ids: Arc<AtomicU64>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             name,
             config,
             message_ids,
+            metrics,
             ready: VecDeque::new(),
             unacked: HashMap::new(),
             deadlines: BTreeSet::new(),
@@ -193,6 +201,9 @@ impl QueueActor {
                 // Relaxed is enough: the counter only has to hand out distinct, increasing
                 // numbers; nothing else is synchronized through it.
                 let id = self.message_ids.fetch_add(1, Ordering::Relaxed) + 1;
+                // Never the body itself: only its size (SPEC §9).
+                tracing::debug!(queue = %self.name, message_id = id, bytes = body.len(), "publish");
+                Metrics::add(&self.metrics.published);
                 let ttl = match (ttl.or(self.config.default_ttl), self.config.max_ttl) {
                     (Some(ttl), Some(max)) => Some(ttl.min(max)),
                     (ttl, _) => ttl,
@@ -248,6 +259,8 @@ impl QueueActor {
             _ => return Err(BrokerError::UnknownDelivery),
         }
         self.take_unacked(tag);
+        Metrics::add(&self.metrics.acked);
+        tracing::debug!(queue = %self.name, consumer, tag, "ack");
         Ok(())
     }
 
@@ -272,6 +285,7 @@ impl QueueActor {
             .take_while(|&&(at, _)| at <= now)
             .map(|&(_, tag)| tag)
             .collect();
+        tracing::debug!(queue = %self.name, count = due.len(), "ack timeout: requeue");
         let back = due
             .into_iter()
             .filter_map(|tag| self.take_unacked(tag))
@@ -285,6 +299,7 @@ impl QueueActor {
             return;
         };
         self.consumers.remove(pos);
+        tracing::debug!(queue = %self.name, consumer, "consumer gone");
         if pos < self.next_consumer {
             self.next_consumer -= 1;
         }
@@ -321,6 +336,8 @@ impl QueueActor {
             // TTL is checked only here, at hand-out (ADR 0005).
             if message.expires_at.is_some_and(|at| at <= Instant::now()) {
                 self.expired += 1;
+                Metrics::add(&self.metrics.expired);
+                tracing::debug!(queue = %self.name, message_id = message.id, "expired");
                 continue;
             }
             self.next_tag += 1;
@@ -338,6 +355,18 @@ impl QueueActor {
             // a closed one that it is gone; either way it's dropped and its messages requeued.
             if consumer.tx.try_send(delivery).is_ok() {
                 consumer.unacked += 1;
+                Metrics::add(&self.metrics.delivered);
+                if message.redelivered {
+                    Metrics::add(&self.metrics.redelivered);
+                }
+                tracing::debug!(
+                    queue = %self.name,
+                    message_id = message.id,
+                    consumer = consumer.id,
+                    tag,
+                    redelivered = message.redelivered,
+                    "deliver"
+                );
                 // A zero ack timeout turns it off; one too large to add is as good as off.
                 let deadline = Instant::now()
                     .checked_add(self.config.ack_timeout)

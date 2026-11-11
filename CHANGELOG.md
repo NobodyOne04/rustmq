@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Structured logs (`tracing`, never message bodies) and runtime metrics in the STATS response
 - Graceful shutdown: stop accepting, close every connection, wait at most `shutdown_timeout`, then abort
 - Resource limits: connections, queues, queue length and total bytes held, each with its own error
 - Ack timeout (unacked deliveries go back to the front) and message TTL, both checked by the queue's own task

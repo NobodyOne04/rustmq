@@ -11,3 +11,4 @@ Files are `NNNN-title.adr` (Markdown). Lower numbers are implemented first, one 
 | [0005](0005-delivery-state-requeue-ttl.adr) | Delivery state: ack timeout and TTL in the queue actor | Accepted |
 | [0006](0006-resource-limits.adr) | Resource limits: where each one is enforced | Accepted |
 | [0007](0007-graceful-shutdown.adr) | Graceful shutdown: a watch channel, a JoinSet and a timeout | Accepted |
+| [0008](0008-observability.adr) | Observability: tracing logs and atomic counters read via STATS | Accepted |

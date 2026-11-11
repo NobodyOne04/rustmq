@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::metrics::Metrics;
 use queue::{Command, QueueActor, Reservation};
 pub use queue::{Delivery, QueueStats};
 
@@ -73,6 +74,7 @@ pub struct Broker {
     /// Body bytes held by all queues (ADR 0006): reserved here before a publish, released
     /// when the message is dropped (see `Reservation`).
     held_bytes: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
 }
 
 impl Broker {
@@ -94,6 +96,7 @@ impl Broker {
             message_ids: Arc::new(AtomicU64::new(0)),
             consumer_ids: AtomicU64::new(0),
             held_bytes: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::default(),
         }
     }
 
@@ -184,6 +187,32 @@ impl Broker {
         rx.await.ok()
     }
 
+    /// Counters updated by the queues and by the server's connections.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    /// Ready messages in all queues: one `Stats` round trip per queue (ADR 0008).
+    pub async fn queued(&self) -> u64 {
+        let queues: Vec<_> = self
+            .queues
+            .lock()
+            .expect("registry lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        let mut total = 0;
+        for tx in queues {
+            let (reply, rx) = oneshot::channel();
+            if tx.send(Command::Stats { reply }).await.is_ok() {
+                if let Ok(stats) = rx.await {
+                    total += stats.ready as u64;
+                }
+            }
+        }
+        total
+    }
+
     pub fn queue_count(&self) -> usize {
         self.queues.lock().expect("registry lock poisoned").len()
     }
@@ -208,7 +237,13 @@ impl Broker {
         }
         let name: Arc<str> = name.into();
         let (tx, rx) = mpsc::channel(COMMAND_BUFFER);
-        let actor = QueueActor::new(name.clone(), self.config, self.message_ids.clone());
+        tracing::info!(queue = %name, "queue created");
+        let actor = QueueActor::new(
+            name.clone(),
+            self.config,
+            self.message_ids.clone(),
+            self.metrics.clone(),
+        );
         tokio::spawn(actor.run(rx));
         queues.insert(name, tx.clone());
         Ok(tx)
@@ -491,6 +526,11 @@ mod tests {
         assert_eq!(&*rx.recv().await.unwrap().body, "long");
         assert_eq!(&*rx.recv().await.unwrap().body, "none");
         assert_eq!(settle(&b, "q").await, stats(0, 2, 1));
+        let m = b.metrics();
+        assert_eq!(
+            [&m.published, &m.delivered, &m.expired].map(Metrics::get),
+            [3, 2, 1]
+        );
     }
 
     #[tokio::test(start_paused = true)]
