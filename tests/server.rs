@@ -605,3 +605,99 @@ async fn stats_reports_the_counters() {
         assert!(attempt < 1000, "gauge never dropped");
     }
 }
+
+#[tokio::test]
+async fn fifo_through_the_server() {
+    let addr = start(limits(1, 16)).await;
+    let mut consumer = Client::hello(addr).await;
+    consumer.subscribe("q").await;
+    let mut producer = Client::hello(addr).await;
+    let mut ids = Vec::new();
+    for i in 0..100 {
+        ids.push(producer.publish("q", &i.to_string()).await);
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let m = consumer.message().await;
+        assert_eq!(
+            (&m["message_id"], &m["body"]),
+            (&json!(id), &json!(i.to_string()))
+        );
+        consumer.ack(&m["delivery_id"]).await;
+    }
+}
+
+/// Producers and competing consumers on two queues at once, over TCP (SPEC §8): every
+/// message delivered exactly once (nobody disconnects, so no redelivery), each to a consumer
+/// of its own queue, and each producer's ids increase in its publish order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_producers_and_consumers_on_two_queues() {
+    const QUEUES: [&str; 2] = ["a", "b"];
+    const PRODUCERS: usize = 4; // per queue
+    const PER_PRODUCER: usize = 250;
+    const CONSUMERS: usize = 3; // per queue
+    let addr = start(limits(5, 16)).await;
+
+    let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut consumers = Vec::new();
+    for queue in QUEUES {
+        for _ in 0..CONSUMERS {
+            let mut c = Client::hello(addr).await;
+            c.subscribe(queue).await;
+            let seen_tx = seen_tx.clone();
+            consumers.push(tokio::spawn(async move {
+                loop {
+                    let m = c.message().await;
+                    seen_tx.send((queue, m.clone())).unwrap();
+                    assert_eq!(c.ack(&m["delivery_id"]).await["type"], "RESPONSE");
+                }
+            }));
+        }
+    }
+
+    let mut producers = Vec::new();
+    for queue in QUEUES {
+        for p in 0..PRODUCERS {
+            producers.push(tokio::spawn(async move {
+                let mut c = Client::hello(addr).await;
+                let mut ids = Vec::new();
+                for i in 0..PER_PRODUCER {
+                    ids.push(c.publish(queue, &format!("{queue}:{p}:{i}")).await);
+                }
+                ids
+            }));
+        }
+    }
+    for p in producers {
+        let ids = p.await.unwrap();
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "ids follow publish order"
+        );
+    }
+
+    let total = QUEUES.len() * PRODUCERS * PER_PRODUCER;
+    let mut ids = std::collections::HashSet::new();
+    let mut bodies = std::collections::HashSet::new();
+    for _ in 0..total {
+        let (queue, m) = tokio::time::timeout(Duration::from_secs(30), seen.recv())
+            .await
+            .expect("not all delivered")
+            .unwrap();
+        assert_eq!(
+            m["queue"], queue,
+            "delivered to a consumer of another queue"
+        );
+        assert_eq!(m["redelivered"], false);
+        let body = m["body"].as_str().unwrap();
+        assert!(body.starts_with(&format!("{queue}:")), "{body} on {queue}");
+        assert!(
+            ids.insert(m["message_id"].as_u64().unwrap()),
+            "delivered twice: {m}"
+        );
+        bodies.insert(body.to_owned());
+    }
+    assert_eq!(bodies.len(), total);
+    for c in consumers {
+        c.abort();
+    }
+}

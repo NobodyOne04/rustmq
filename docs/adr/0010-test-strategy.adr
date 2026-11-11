@@ -1,0 +1,36 @@
+# 0010. Tests: in-process server, reply-driven sync, paused clock
+
+- Status: Accepted
+- Date: 2026-11-11
+
+Integration tests run the real server inside the test process and wait on protocol replies
+rather than on time, so they are fast and deterministic.
+
+## Technical details
+
+**Problem.** The spec lists unit, integration and concurrency tests, deterministic where
+practical, with no sleeps for synchronization (SPEC §8).
+
+**How it works.**
+- **Unit tests** in each module (`#[cfg(test)]`), as already done in `src/protocol.rs` and
+  `src/broker.rs`.
+- **Integration and concurrency tests** in `tests/`: start `server::run` in-process on
+  `127.0.0.1:0` (the OS picks a free port) and talk to it through `client`.
+- **Sync on replies, not time:** wait for SUBSCRIBE's RESPONSE before publishing; read
+  messages with a bounded `timeout` that only turns a hang into a failure.
+- **Timeouts and TTL:** `tokio::time::pause()` / `advance()` (`test-util`, dev only).
+- **Concurrency:** many publishing/consuming tasks; assertions on `message_id`s: none held
+  twice, all delivered, queues isolated.
+- Flakiness check before each PR: run the new tests repeatedly (as done for 0003, 30 runs).
+
+**Consequences.**
+- Tests run in parallel by default; each starts its own server.
+- The CLI wiring in `main.rs` has no automated test; it's checked by hand (§6).
+
+## Technologies and alternatives
+- Involved: tokio (`macros`, `rt-multi-thread`, `time`, `test-util`).
+- Alternatives:
+  - Spawning the `rustmq` binary: closer to real use, slower, port/process handling is flaky.
+  - Real sleeps: slow and flaky.
+  - `loom` model checking: strong, but tuned for lock-based code, which
+    [0003](0003-queue-actor-per-queue.adr) avoids.
