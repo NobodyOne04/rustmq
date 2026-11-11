@@ -23,6 +23,8 @@ cargo run -- server --log debug                     # then publish/consume/statu
 - `src/metrics.rs`: shared atomic counters, read by STATS (ADR 0008)
 - `src/server.rs`: `run(listener, broker, config, shutdown)`, the accept loop and shutdown
   (ADR 0007); per connection a reader and a writer task (ADR 0004)
+- `.github/workflows/telegram.yml`: posts PRs, merges and CI results to Telegram; secrets
+  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (comma-separated chat IDs)
 - `tests/`: integration tests, through the library's public API; `tests/server.rs` over real TCP
   with raw JSON (wire format), `tests/client.rs` through `client`
   (`tests/logs.rs` is its own binary: `tracing` caches who listens per process)
