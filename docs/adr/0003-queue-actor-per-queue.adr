@@ -3,41 +3,77 @@
 - Status: Accepted
 - Date: 2026-11-11
 
-## Context
-Many connections publish to, consume from and ack the same queue at once. The spec requires
-FIFO, no message held by two consumers at once, requeue on disconnect, and that one queue
-never blocks another (§2.4, §2.6, §7). Ack timeouts and TTL (§14.3) need timers.
+Each queue is a tokio task that alone owns the queue's state; everything else sends it
+commands. FIFO, "one holder per message" and isolation between queues then hold without locks.
 
-## Decision
-- Each queue is a tokio task that alone owns its state: the ready messages (`VecDeque`), the
-  unacked deliveries, and the subscribed consumers.
-- Others talk to it through a bounded `mpsc` channel of commands (`Publish`, `Subscribe`,
-  `Ack`, `ConsumerGone`, `Stats`). Commands that need an answer carry a `oneshot` reply;
-  PUBLISH is acked to the producer only after the actor replies "accepted".
-- A registry (`broker`) maps queue names to actor handles and creates actors on first use.
+## Technical details
 
-## Alternatives
-- **Shared state behind a lock** (`Arc<Mutex<QueueState>>` + `Notify`): fewer moving parts
-  for publish/consume, but ack timeouts need a separate scanner task, requeue on disconnect
-  competes for the same lock, fairness between consumers is up to lock order, and an async
-  mutex invites holding the lock across `.await`.
-- **One global broker task:** simplest ordering, but every queue waits on every other
-  (breaks §2.6).
+**Problem.** Many connections publish to, consume from and ack the same queue at once. The
+spec requires FIFO, no message held by two consumers at once, requeue on disconnect, and that
+one queue never blocks another (SPEC §2.4, §2.6, §7). Ack timeouts and TTL (§14.3) will need
+timers in the same place.
 
-## Rationale
-With one owner, FIFO and single-holder delivery follow from the code being sequential: no
-lock, no race to reason about. Queues share nothing, so isolation is structural.
-Rust note: "share memory by communicating". The queue state is moved into the task; the
-borrow checker then guarantees no one else touches it, and `Send`-checked channels carry
-the only access.
+**The actor** (`src/broker/queue.rs`, `QueueActor`). Owns:
+- `ready: VecDeque<Message>`: messages waiting, front is next;
+- `unacked: HashMap<tag, Unacked>`: delivered, not yet acked, with the consumer holding each;
+- `consumers: Vec<Consumer>`: each with its delivery channel and unacked count;
+- counters: `next_tag` (delivery tags, per queue) and `next_consumer` (round-robin cursor).
 
-## Consequences
+`run()` loops on `commands.recv()`: handle one `Command`, then `dispatch()`. It ends when every
+sender to the queue is dropped.
+
+**Commands** (bounded `mpsc`, `COMMAND_BUFFER = 1024` per queue; answers via `oneshot`):
+- `Publish {body}` → assigns `message_id` from the shared `AtomicU64`, pushes to the back,
+  replies with the id. The producer's RESPONSE is sent only after this reply, so a message is
+  never acked before it is in the queue (§2.3).
+- `Subscribe {consumer, tx}` → adds the consumer (idempotent), replies when registered.
+- `Ack {consumer, tag}` → only the holder may ack; anything else (wrong consumer, unknown or
+  already-acked tag) is `BrokerError::UnknownDelivery`.
+- `ConsumerGone {consumer}` → removes it and requeues its unacked messages.
+- `Stats` → `QueueStats {ready, unacked}`.
+
+**Dispatch.** While messages are ready, pick the next consumer round-robin whose `unacked <
+prefetch`, pop the front, and `try_send` a `Delivery {queue, message_id, tag, body,
+redelivered}`.
+- Never `.await` on a consumer: a stalled client must not stall the queue.
+- `try_send` fails (channel full or closed): the consumer is dropped and the message and its
+  other unacked messages are requeued. A channel smaller than `prefetch` is a caller bug;
+  the rule's long-term form is proposed in [0004](0004-connection-reader-writer.adr).
+
+**Requeue.** The consumer's unacked messages are sorted by `message_id` (ids grow in publish
+order within a queue) and pushed to the front in that order, marked `redelivered`. A
+redelivery gets a new tag.
+
+**Registry** (`src/broker.rs`, `Broker`).
+- `queues: std::sync::Mutex<HashMap<Arc<str>, mpsc::Sender<Command>>>`. The lock is held only
+  to look up or insert a sender, never across an `.await`.
+- The first command for an unknown name spawns its actor (`tokio::spawn`).
+- API: `publish`, `subscribe`, `ack`, `consumer_gone`, `queue_stats`, `queue_count`,
+  `new_consumer_id`. Errors: `BrokerError::{UnknownDelivery, QueueStopped}`.
+- `prefetch` is a constructor argument, at least 1.
+
+**Why.** With one owner, FIFO and single-holder delivery follow from sequential code: no
+lock, no race to reason about. Queues share nothing, so isolation is structural. Rust note:
+"share memory by communicating". The state moves into the task, the borrow checker
+guarantees no one else touches it, and `Send`-checked channels are the only way in. Bodies
+are `Arc<str>`, so keeping a message in `unacked` while sending it costs a pointer copy, not a
+body copy.
+
+**Consequences.**
 - One channel hop per operation; irrelevant at this scale.
-- A bounded command channel gives back-pressure: a fast producer waits, others don't.
-- Actor code must never `.await` on anything a client controls (see
-  [0004](0004-connection-reader-writer.adr)), or a client could stall the queue.
-- Debugging is through logs/state dumps, not by inspecting shared memory.
+- The bounded command channel is back-pressure: a fast producer waits, other queues don't.
+- Actor code must never `.await` on anything a client controls.
+- No timers yet: ack timeout and TTL are proposed in
+  [0005](0005-delivery-state-requeue-ttl.adr); limits in
+  [0006](0006-resource-limits.adr).
+- Debugging is through logs and STATS, not by inspecting shared memory.
+- Tests (`src/broker.rs`): FIFO, prefetch, ack by holder only, round-robin, requeue order,
+  dropped and too-slow consumers, queue isolation, 8 producers × 500 messages with 4
+  competing consumers.
 
-## References
-SPEC §2.4, §2.6, §7; [0004](0004-connection-reader-writer.adr),
-[0005](0005-delivery-state-requeue-ttl.adr).
+## Technologies and alternatives
+- Involved: tokio 1 (`rt`, `sync`: `mpsc`, `oneshot`, `spawn`), std `Mutex`, `AtomicU64`.
+- Alternatives:
+  - Shared state behind a lock (`Arc<Mutex<QueueState>>` + `Notify`): ack timeouts need a
+    separate scanner, requeue competes for the lock, fairness depends on lock order.
+  - One global broker task: simplest ordering, but every queue waits on every other (§2.6).

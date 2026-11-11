@@ -3,36 +3,53 @@
 - Status: Accepted
 - Date: 2026-11-11
 
-## Context
-The spec names logical components (server, protocol, broker, queue, consumer, producer,
-config, observability) but says they need not be separate crates (§4). Integration tests
-must drive the server and a client from Rust code (§8). Scope is 1–2 weeks.
+rustmq is one cargo package: all logic in a library, a thin `rustmq` binary for the CLI. This
+lets integration tests call the broker directly while keeping a single build.
 
-## Decision
-One cargo package with `src/lib.rs` and `src/main.rs`:
-- library modules: `config`, `protocol`, `broker` (registry + queue), `server`, `client`,
-  `metrics`
-- `main.rs` is only the clap CLI (`server`, `publish`, `consume`, `status`)
-- Producer and consumer logic live in `client`, shared by the CLI and `tests/`
-- CI on every PR: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test`
+## Technical details
 
-## Alternatives
-- **Cargo workspace** (`rustmq-protocol`, `rustmq-broker`, `rustmq-cli`): the compiler
-  enforces boundaries, but more manifests and setup for the same module graph.
-- **Binary only**: tests in `tests/` can't call into a binary crate, so integration tests
-  would have to spawn processes.
+**Problem.** The spec names logical components (server, protocol, broker, queue, consumer,
+producer, config, observability) but doesn't require separate crates (SPEC §4). Integration
+tests must drive a server and clients from Rust code (§8). Scope is 1–2 weeks.
 
-## Rationale
-Rust note: files in `tests/` are separate crates that can only use the library's public
-API. A lib + bin split gives that API for free and keeps one `Cargo.toml`. Module privacy
-(`pub(crate)`) is enough to keep boundaries at this size.
+**Layout.**
+- `Cargo.toml`: package `rustmq`, edition 2024, `rust-version = "1.85"`, `publish = false`.
+- `src/lib.rs`: declares the library modules. Planned set: `config`, `protocol`, `broker`
+  (registry + queue), `server`, `client`, `metrics`. Each arrives with the ADR that needs it;
+  so far `protocol` ([0002](0002-wire-protocol-ndjson.adr)) and `broker`
+  ([0003](0003-queue-actor-per-queue.adr)).
+- `src/main.rs`: only the clap CLI (`#[derive(Parser)]`). Subcommands `server`, `publish`,
+  `consume`, `status` are added as their parts exist; today it has `--help` and `--version`.
+- Producer and consumer logic will live in `client`, shared by the CLI and `tests/`.
+- `tests/`: integration tests. Each file there is its own crate and sees only the library's
+  public (`pub`) API.
 
-## Consequences
-- One build, one version, simple CI.
-- Boundaries are kept by review, not by the compiler; a module can reach into another's
+**Rules set in `Cargo.toml`.**
+- `[lints.rust] unsafe_code = "forbid"`: any `unsafe` fails the build (SPEC §5).
+- Dependencies are added with the ADR that needs them, each with a reason in that ADR.
+
+**CI** (`.github/workflows/check.yml`, on every PR and push to `main`):
+```sh
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+`--locked` fails if `Cargo.lock` is out of date, so CI builds exactly what was committed.
+
+**Why.** Rust note: a binary crate exposes nothing to other crates, so tests in `tests/` could
+only spawn it as a process. A lib + bin split gives them the library's API for free, and one
+`Cargo.toml` keeps versions and features in one place. Module privacy (`pub(crate)`) is enough
+to keep boundaries at this size.
+
+**Consequences.**
+- One build, one version, a short CI file.
+- Boundaries are kept by review, not by the compiler: a module can reach another's
   `pub(crate)` items.
-- Splitting into a workspace later is mechanical if it's ever needed.
+- Splitting into a workspace later is mechanical, if it's ever needed.
 
-## References
-SPEC §4, §8, §14.6.
+## Technologies and alternatives
+- Involved: cargo, Rust 1.85+ (edition 2024), clap 4 (`derive`), GitHub Actions.
+- Alternatives:
+  - Cargo workspace (`rustmq-protocol`, `rustmq-broker`, `rustmq-cli`): compiler-enforced
+    boundaries, but more manifests for the same module graph.
+  - Binary only: integration tests would have to spawn processes.

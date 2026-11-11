@@ -3,46 +3,78 @@
 - Status: Accepted
 - Date: 2026-11-11
 
-## Context
-The spec requires explicit framing, versioning, JSON, a maximum frame size, request IDs,
-explicit errors and persistent connections, documented apart from the code (§3). Stage 1
-settled the choices (§14.2); this records them and how they are implemented.
+Clients and the broker exchange one JSON object per line over TCP, starting with a HELLO that
+picks the protocol version. Any language can speak it, and it can be typed by hand with `nc`.
 
-## Decision
-- **Framing:** one compact JSON object per line (`\n`). Lines are read through
-  `take(max_frame_size + 1)`, so an oversized frame is detected without buffering it whole;
-  then `ERROR FRAME_TOO_LARGE` and the connection closes.
-- **Messages:** one Rust enum per direction, serialized with `#[serde(tag = "type")]`
-  (`{"type":"PUBLISH", …}`). Client → server: HELLO, PUBLISH, SUBSCRIBE, ACK, STATS.
-  Server → client: RESPONSE, ERROR, MESSAGE. Unknown fields are rejected
-  (`deny_unknown_fields`).
-- **Handshake:** HELLO must be the first frame; the server picks the highest common version and
-  returns its limits, or sends `ERROR UNSUPPORTED_VERSION` and closes.
-- **IDs** (u64): `request_id` (client, echoed), `message_id` (server, global, stable across
-  redelivery), `delivery_id` (server, per connection, new per delivery; ACK names it).
-- **Errors:** a fixed set of codes (`BAD_REQUEST`, `UNSUPPORTED_VERSION`,
-  `FRAME_TOO_LARGE`, `MESSAGE_TOO_LARGE`, `INVALID_QUEUE_NAME`, `QUEUE_FULL`,
-  `TOO_MANY_QUEUES`, `TOO_MANY_SUBSCRIPTIONS`, `TOO_MANY_CONNECTIONS`,
-  `UNKNOWN_DELIVERY`, `INTERNAL`) with a fixed human text.
-- `docs/PROTOCOL.md` documents frames, fields, errors and examples, without Rust details.
+## Technical details
 
-## Alternatives
-- **4-byte length prefix + JSON:** oversized frames can be skipped without closing, but it is
-  binary and can't be typed by hand with `nc`. Rejected in Stage 1 (tech debt, §14.7).
-- **`"v"` in every frame instead of HELLO:** simpler, but nothing can be negotiated and the
-  client doesn't learn the server's limits.
-- **tokio-util `LinesCodec`:** does the line splitting with a max length, but is an extra
-  dependency for ~20 lines of code.
+**Problem.** The spec requires explicit framing, versioning, JSON, a maximum frame size,
+request IDs, explicit errors and persistent connections, documented apart from the code
+(SPEC §3). Stage 1 settled the choices (§14.2). The language-neutral description is
+[`docs/PROTOCOL.md`](../PROTOCOL.md); this ADR records the decisions and how
+`src/protocol.rs` implements them.
 
-## Rationale
-Any language can speak it with a JSON library and a socket, and manual tests work with
-`nc localhost 7000`. Rust note: serde's internally tagged enums turn the `type` field into
-an enum variant, so an unknown or malformed message is a deserialization error, never a panic.
+**Framing.**
+- A frame is one compact JSON object followed by `\n`. JSON escapes newlines inside strings,
+  so a raw `\n` only ever ends a frame.
+- Frame limit: `max_message_size + ENVELOPE_OVERHEAD` (4096 bytes), announced in HELLO.
+- `read_frame(reader, max_frame)` reads through `take(max_frame + 1)` with `read_until(b'\n')`,
+  so at most `max_frame + 1` bytes are buffered, however large the incoming frame is:
+  - ends with `\n`: returns the frame without it;
+  - no `\n` and over the limit: `ProtocolError::FrameTooLarge`. The stream is now mid-frame
+    with no way to resync, so the server answers `ERROR FRAME_TOO_LARGE` and closes;
+  - 0 bytes: clean end of stream (`Ok(None)`); EOF mid-frame: `UnexpectedEof`.
+- `write_frame` serializes with `serde_json::to_vec` and appends `\n`.
 
-## Consequences
-- Oversized frame closes the connection (accepted tech debt).
-- JSON escaping makes bodies with many special characters larger on the wire.
-- Changing a message is a protocol version bump.
+**Messages.**
+- Client → server, enum `Request`: `HELLO {versions}`, `PUBLISH {queue, body, ttl_ms?}`,
+  `SUBSCRIBE {queue}`, `ACK {delivery_id}`, `STATS`. Every request has `request_id`.
+- Server → client, enum `ServerFrame`: `RESPONSE`, `ERROR`, `MESSAGE`.
+  - `RESPONSE {request_id, version?, limits?, message_id?, stats?}`: the optional fields
+    depend on the request answered (HELLO, PUBLISH, STATS) and are left out when empty.
+  - `ERROR {request_id?, code, message}`: no `request_id` when the frame couldn't be parsed.
+  - `MESSAGE {queue, message_id, delivery_id, body, redelivered}`.
+- Both enums use `#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE",
+  deny_unknown_fields)]`. Unknown type, unknown or missing field, wrong field type, wrong case
+  and non-JSON all become `ProtocolError::Malformed`, which maps to `BAD_REQUEST`.
+- `Request::validate(max_queue_name_len, max_message_size)` checks queue names
+  (`[A-Za-z0-9._-]`, 1..=255 bytes by default) and the body's size in UTF-8 bytes.
 
-## References
-SPEC §3, §14.2, §14.7; [0009](0009-typed-errors.adr).
+**Handshake.** HELLO must be the first frame. `negotiate(versions)` picks the highest version
+in both `VERSIONS` (`[1]`) and the client's list. The answer carries the version and
+`Limits {max_message_size, max_frame_size, max_queue_name_len, max_subscriptions, prefetch}`;
+no common version: `ERROR UNSUPPORTED_VERSION` and close. A missing first HELLO is
+`BAD_REQUEST` and close; a second HELLO is `BAD_REQUEST` and the connection stays open.
+
+**IDs** (all `u64`): `request_id` (client, echoed, not checked for uniqueness),
+`message_id` (server, global, unchanged on redelivery so consumers can drop duplicates),
+`delivery_id` (server, per connection, new for every delivery; ACK names it).
+
+**Errors.** `ErrorCode`: `BAD_REQUEST`, `UNSUPPORTED_VERSION`, `FRAME_TOO_LARGE`,
+`MESSAGE_TOO_LARGE`, `INVALID_QUEUE_NAME`, `QUEUE_FULL`, `TOO_MANY_QUEUES`,
+`TOO_MANY_SUBSCRIPTIONS`, `TOO_MANY_CONNECTIONS`, `UNKNOWN_DELIVERY`, `INTERNAL`.
+`ErrorCode::message()` gives a fixed text, and `ServerFrame::error()` always uses it, so
+internal details never reach a client. `ProtocolError::code()` maps read errors to codes.
+
+**Why.** Text framing makes manual tests trivial (`nc localhost 7000`) and needs nothing but
+a JSON library on the client side. Rust note: serde's internally tagged enums turn the `type`
+field into an enum variant at parse time, so the rest of the code `match`es on variants and a
+malformed message is an error value, never a panic.
+
+**Consequences.**
+- An oversized frame closes the connection (accepted tech debt, SPEC §14.7).
+- JSON escaping can make a frame much larger than its body (a control character becomes
+  `\u0000`); such a body can hit the frame limit before the message limit.
+- Changing a message's shape is a protocol version bump.
+- `src/protocol.rs` and `docs/PROTOCOL.md` must change together.
+
+## Technologies and alternatives
+- Involved: serde 1 (`derive`), serde_json 1, thiserror 2, tokio 1 (`io-util`:
+  `AsyncBufReadExt`, `AsyncWriteExt`).
+- Alternatives:
+  - 4-byte length prefix + JSON: could skip an oversized frame and keep the connection, but
+    binary, so no `nc`. Rejected in Stage 1.
+  - `"v"` in every frame instead of HELLO: nothing can be negotiated, and clients don't
+    learn the server's limits.
+  - tokio-util `LinesCodec`: line splitting with a max length, but an extra dependency for
+    ~20 lines.
