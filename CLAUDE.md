@@ -16,6 +16,7 @@ cargo run -- --help
 - `docs/PROTOCOL.md`: the wire protocol, language-neutral; keep it in sync with `src/protocol.rs`
 - `docs/adr/`: architecture decision records (`NNNN-title.adr`), index in its README
 - `src/lib.rs`: everything; `src/main.rs`: only the clap CLI (ADR 0001)
+- `src/broker.rs`: queue registry; `src/broker/queue.rs`: the per-queue actor (ADR 0003)
 - `tests/`: integration tests, through the library's public API
 
 ## Conventions
