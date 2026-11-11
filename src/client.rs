@@ -224,7 +224,8 @@ impl Client {
     async fn read(&mut self) -> Result<ServerFrame, ClientError> {
         // Headroom over `max_frame_size`: a MESSAGE carries more fields than the PUBLISH
         // that brought its body, so it can be slightly longer than the largest PUBLISH frame.
-        let max = self.limits.max_frame_size + ENVELOPE_OVERHEAD;
+        // `saturating_add`: the size comes from the server, and `+` would panic on overflow.
+        let max = self.limits.max_frame_size.saturating_add(ENVELOPE_OVERHEAD);
         let frame = read_frame(&mut self.read, &mut self.buf, max)
             .await?
             .ok_or(ClientError::Closed)?;
