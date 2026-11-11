@@ -12,3 +12,6 @@
 
 ### Changed
 - ADRs 0001–0003 rewritten in the new template (purpose, technical details, technologies), with the details of what was built
+
+### Fixed
+- A huge `ttl_ms` (or ack timeout) no longer panics the queue's task and leaves the queue answering INTERNAL
