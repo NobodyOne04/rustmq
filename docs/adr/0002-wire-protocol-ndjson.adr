@@ -1,0 +1,48 @@
+# 0002. Wire protocol: newline-delimited JSON with a HELLO handshake
+
+- Status: Accepted
+- Date: 2026-11-11
+
+## Context
+The spec requires explicit framing, versioning, JSON, a maximum frame size, request IDs,
+explicit errors and persistent connections, documented apart from the code (§3). Stage 1
+settled the choices (§14.2); this records them and how they are implemented.
+
+## Decision
+- **Framing:** one compact JSON object per line (`\n`). Lines are read through
+  `take(max_frame_size + 1)`, so an oversized frame is detected without buffering it whole;
+  then `ERROR FRAME_TOO_LARGE` and the connection closes.
+- **Messages:** one Rust enum per direction, serialized with `#[serde(tag = "type")]`
+  (`{"type":"PUBLISH", …}`). Client → server: HELLO, PUBLISH, SUBSCRIBE, ACK, STATS.
+  Server → client: RESPONSE, ERROR, MESSAGE. Unknown fields are rejected
+  (`deny_unknown_fields`).
+- **Handshake:** HELLO must be the first frame; the server picks the highest common version and
+  returns its limits, or sends `ERROR UNSUPPORTED_VERSION` and closes.
+- **IDs** (u64): `request_id` (client, echoed), `message_id` (server, global, stable across
+  redelivery), `delivery_id` (server, per connection, new per delivery; ACK names it).
+- **Errors:** a fixed set of codes (`BAD_REQUEST`, `UNSUPPORTED_VERSION`,
+  `FRAME_TOO_LARGE`, `MESSAGE_TOO_LARGE`, `INVALID_QUEUE_NAME`, `QUEUE_FULL`,
+  `TOO_MANY_QUEUES`, `TOO_MANY_SUBSCRIPTIONS`, `TOO_MANY_CONNECTIONS`,
+  `UNKNOWN_DELIVERY`, `INTERNAL`) with a fixed human text.
+- `docs/PROTOCOL.md` documents frames, fields, errors and examples, without Rust details.
+
+## Alternatives
+- **4-byte length prefix + JSON:** oversized frames can be skipped without closing, but it is
+  binary and can't be typed by hand with `nc`. Rejected in Stage 1 (tech debt, §14.7).
+- **`"v"` in every frame instead of HELLO:** simpler, but nothing can be negotiated and the
+  client doesn't learn the server's limits.
+- **tokio-util `LinesCodec`:** does the line splitting with a max length, but is an extra
+  dependency for ~20 lines of code.
+
+## Rationale
+Any language can speak it with a JSON library and a socket, and manual tests work with
+`nc localhost 7000`. Rust note: serde's internally tagged enums turn the `type` field into
+an enum variant, so an unknown or malformed message is a deserialization error, never a panic.
+
+## Consequences
+- Oversized frame closes the connection (accepted tech debt).
+- JSON escaping makes bodies with many special characters larger on the wire.
+- Changing a message is a protocol version bump.
+
+## References
+SPEC §3, §14.2, §14.7; [0009](0009-typed-errors.adr).
